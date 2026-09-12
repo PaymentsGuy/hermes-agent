@@ -519,6 +519,31 @@ def ledger_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
         return True
 
 
+def list_delivery_receipts(profile_home: str | os.PathLike[str]) -> List[Dict[str, Any]]:
+    """Return bounded metadata for owner-ledger consumers; never expose content."""
+    path = os.fspath(profile_home)
+    db_path = os.path.join(path, "state.db")
+    if not os.path.isfile(db_path):
+        return []
+    try:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+            rows = conn.execute(
+                """SELECT obligation_id, platform, state, attempts, created_at, updated_at,
+                          owner_pid, owner_started_at
+                   FROM delivery_obligations ORDER BY updated_at DESC"""
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [
+        {
+            "obligation_id": row[0], "platform": row[1], "state": row[2],
+            "attempts": row[3], "created_at": row[4], "updated_at": row[5],
+            "owner_pid": row[6], "owner_started_at": row[7],
+        }
+        for row in rows
+    ]
+
+
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).

@@ -58,6 +58,22 @@ def _row(oid):
     }
 
 
+def test_list_delivery_receipts_is_content_free_and_profile_scoped(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    with patch.object(dl, "_db_path", lambda: home / "state.db"):
+        _record("weekly-intelligence", content="private brief body")
+        dl.mark_delivered("weekly-intelligence")
+    rows = dl.list_delivery_receipts(home)
+    assert len(rows) == 1
+    assert rows[0]["obligation_id"] == "weekly-intelligence"
+    assert rows[0]["platform"] == "slack"
+    assert rows[0]["state"] == "delivered"
+    assert rows[0]["attempts"] == 0
+    assert "content" not in rows[0]
+    assert "last_error" not in rows[0]
+
+
 def _blocking_probe():
     """Return a blocking ledger call and an event-loop progress witness."""
     ledger_started = threading.Event()
