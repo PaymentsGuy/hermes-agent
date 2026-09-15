@@ -968,10 +968,12 @@ def _(rid, params: dict) -> dict:
     session, text, parent, task_id, err = _side_agent_args(rid, params, "bg")
     if err:
         return err
+    agent_kwargs = _background_agent_kwargs(
+        session["agent"], task_id, profile_home=session.get("profile_home"))
 
     def body():
         from run_agent import AIAgent
-        result = AIAgent(**_background_agent_kwargs(session["agent"], task_id)).run_conversation(
+        result = AIAgent(**agent_kwargs).run_conversation(
             user_message=text, task_id=task_id)
         return _final_response_text(result)
 
@@ -1033,6 +1035,8 @@ def _(rid, params: dict) -> dict:
     task_id = f"preview_{uuid.uuid4().hex[:6]}"
     parent = params.get("session_id", "")
     parent_history = _preview_restart_history(session)
+    agent_kwargs = _ephemeral_preview_agent_kwargs(
+        session["agent"], task_id, profile_home=session.get("profile_home"))
     prompt = "\n".join(
         line
         for line in [
@@ -1065,7 +1069,7 @@ def _(rid, params: dict) -> dict:
         # Deliberately NOT closed via AIAgent.close(): it would kill the background
         # server this task exists to leave running.
         result = AIAgent(
-            **_ephemeral_preview_agent_kwargs(session["agent"], task_id),
+            **agent_kwargs,
             **_preview_restart_callbacks(parent, task_id),
         ).run_conversation(
             user_message=prompt, task_id=task_id, conversation_history=parent_history or None)

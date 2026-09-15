@@ -11,6 +11,7 @@ and an ``__init__.py`` exposing ``register(ctx)``. Plugins register callbacks fo
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import importlib.metadata
 import inspect
 import json
@@ -21,6 +22,7 @@ import re
 import sys
 import threading
 import types
+import weakref
 from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -218,6 +220,16 @@ class PluginContext:
         self.manifest = manifest
         self._manager = manager
         self._llm: Any = None  # lazy; tests preseed it (see ``llm``)
+        from tools.registry import registry
+        self._tool_registration_registry = registry
+        self._tool_registration_generation = manager._activate_plugin_context(self.plugin_id)
+        registry._bind_plugin_context(
+            self, manager, manager_generation=self._tool_registration_generation,
+            plugin_key=self.plugin_id, scope=manager.scope_key,
+        )
+        manager._bind_plugin_context_registry(
+            self.plugin_id, self._tool_registration_generation, registry
+        )
 
     @property
     def plugin_id(self) -> str:
@@ -449,7 +461,8 @@ class PluginContext:
     def register_tool(
         self, name: str, toolset: str, schema: dict, handler: Callable,
         check_fn: Callable | None = None, requires_env: list | None = None, is_async: bool = False,
-        description: str = "", emoji: str = "", override: bool = False,
+        description: str = "", emoji: str = "", override: bool = False, *,
+        human_approval: str | None = None, approval_preview: Callable | None = None,
     ) -> Optional[PluginRegistration]:
         """Register a tool in the global registry and track it as plugin-provided. ``override=True``
         replaces a same-named built-in (without it a name claimed by another toolset is rejected) and
@@ -459,6 +472,10 @@ class PluginContext:
         ``override=True`` against a built-in tool requires the operator to opt in via
         ``plugins.entries.<plugin_id>.allow_tool_override: true`` in config.yaml — mirrors the trust gate
         pattern used for ``ctx.llm`` provider/model overrides (#23194).
+
+        ``human_approval="always"`` declares intrinsic approval metadata and requires a synchronous,
+        read-only ``approval_preview(args, context)`` resolver. The resolver is stored for the host's
+        approval owner; registration itself neither invokes the resolver nor dispatches the handler.
         """
         if override and not self._tool_override_allowed(name):
             raise PluginToolOverrideError(
@@ -466,18 +483,34 @@ class PluginContext:
                 f"plugins.entries.{self.plugin_id}.allow_tool_override: true "
                 f"in config.yaml to allow this plugin to replace built-in tools."
             )
-        from tools.registry import registry
+        registry = self._tool_registration_registry
         scope = self._manager.scope_key
         previous = registry.snapshot_registration(name, scope=scope)
         if previous is None and not override and registry.get_entry(name, scope=scope) is not None:
             logger.warning("Plugin %s tried to shadow global tool %s without override=True",
                            self.manifest.name, name)
             return None
-        registry.register(
-            name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
-            requires_env=requires_env, is_async=is_async, description=description, emoji=emoji,
-            override=override, scope=scope,
-        )
+        if human_approval is None and approval_preview is None:
+            registry.register(
+                name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
+                requires_env=requires_env, is_async=is_async, description=description, emoji=emoji,
+                override=override, scope=scope,
+            )
+        else:
+            capability = registry._issue_plugin_tool_registration(
+                context=self, manager=self._manager,
+                manager_generation=self._tool_registration_generation,
+                plugin_key=self.plugin_id, scope=scope, name=name,
+            )
+            registry._register_plugin_tool(
+                capability, context=self, manager=self._manager,
+                manager_generation=self._tool_registration_generation,
+                plugin_key=self.plugin_id, name=name, toolset=toolset, schema=schema,
+                handler=handler, check_fn=check_fn, requires_env=requires_env,
+                is_async=is_async, description=description, emoji=emoji,
+                override=override, scope=scope, human_approval=human_approval,
+                approval_preview=approval_preview,
+            )
         registered = registry.snapshot_registration(name, scope=scope)
         handle = None
         if registered is not None and registered is not previous and registered.handler is handler:
@@ -679,13 +712,42 @@ class PluginContext:
     def dispatch_tool(self, tool_name: str, args: dict, **kwargs) -> str:
         """Dispatch a tool call through the registry with the parent agent (when available)
         resolved automatically; returns the handler's JSON string. ``kwargs`` forward to dispatch."""
+        from tools.registry import tool_error
+
+        scope = self._manager.scope_key
+        if self._tool_registration_registry._intrinsic_handler_active_in_scope(scope):
+            return tool_error("Tool dispatch denied")
+
+        from tools.intrinsic_approval import get_intrinsic_approval_receipt_context
+        if get_intrinsic_approval_receipt_context() is not None:
+            return tool_error("Tool dispatch denied")
+
+        from agent.model_tool_policy import model_tool_policy_denial
         from tools.registry import registry
         # In gateway mode _cli_ref is None — tools degrade gracefully (no spinner, TERMINAL_CWD).
         if "parent_agent" not in kwargs:
             agent = getattr(self._manager._cli_ref, "agent", None)
             if agent is not None:
                 kwargs["parent_agent"] = agent
-        return registry.dispatch(tool_name, args, scope=self._manager.scope_key, **kwargs)
+        parent_agent = kwargs.get("parent_agent")
+        if parent_agent is not None:
+            try:
+                denial = model_tool_policy_denial(
+                    tool_name,
+                    call_origin="model",
+                    policy=getattr(parent_agent, "model_tool_policy", None),
+                )
+            except Exception:
+                return tool_error("Tool dispatch denied by parent model-tool policy")
+            if denial:
+                return tool_error(denial)
+        return registry.dispatch(tool_name, args, scope=scope, **kwargs)
+
+    def dispatch_approved_tool(self, tool_name: str, args: dict) -> str | dict:
+        """Consume one exact approval-bound downstream dispatch, or fail closed."""
+        from tools.intrinsic_approval import dispatch_intrinsic_approved_tool
+
+        return dispatch_intrinsic_approved_tool(self, tool_name, args)
 
     @_serialized_replacement
     def register_context_engine(self, engine) -> Optional[PluginRegistration]:
@@ -1169,6 +1231,8 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # any remaining process-global slots when the symmetric force-reload lands.
         self._ownership_ledger: Dict[str, List[PluginRegistration]] = {}
         self._registration_order: List[PluginRegistration] = []
+        self._plugin_context_generations: Dict[str, object] = {}
+        self._plugin_context_registries: Dict[tuple[str, object], weakref.WeakSet] = {}
         # Force re-discovery drains this via _evict_stale_persistent_registrations(): entries whose plugin
         # re-registered the same (kind, key) are kept (the upsert rotated them in place), the rest are
         # disposed so a disabled/removed auth plugin's provider does not outlive its plugin (#91701
@@ -1179,6 +1243,33 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # and contributed tool names (so `hermes plugins list` still attributes them).
         self._predeclared_modules: Dict[str, types.ModuleType] = {}
         self._predeclared_tools: Dict[str, List[str]] = {}
+
+    def _activate_plugin_context(self, plugin_key: str) -> object:
+        """Return the current identity generation for a plugin's host-owned contexts."""
+        return self._plugin_context_generations.setdefault(plugin_key, object())
+
+    def _plugin_context_generation_is_active(self, plugin_key: str, generation: object) -> bool:
+        return self._plugin_context_generations.get(plugin_key) is generation
+
+    def _bind_plugin_context_registry(
+        self, plugin_key: str, generation: object, registry: Any,
+    ) -> None:
+        self._plugin_context_registries.setdefault(
+            (plugin_key, generation), weakref.WeakSet()
+        ).add(registry)
+
+    def _invalidate_plugin_contexts(self, plugin_keys) -> None:
+        for plugin_key in plugin_keys:
+            generation = self._plugin_context_generations.pop(plugin_key, None)
+            if generation is None:
+                continue
+            registries = self._plugin_context_registries.pop(
+                (plugin_key, generation), weakref.WeakSet()
+            )
+            for registry in tuple(registries):
+                registry._purge_plugin_context_generation(
+                    manager=self, manager_generation=generation, plugin_key=plugin_key
+                )
 
     @property
     def has_gateway_message_injector(self) -> bool:
@@ -1745,7 +1836,15 @@ def fire_pre_command_hook(
         logger.debug("pre_command hook dispatch failed (non-fatal): %s", exc)
 
 
-_thread_tool_whitelist = threading.local()
+@dataclass(frozen=True)
+class _ToolWhitelistContext:
+    allowed: Optional[frozenset[str]]
+    deny_msg_fmt: str
+
+
+_tool_whitelist_context: contextvars.ContextVar[Optional[_ToolWhitelistContext]] = (
+    contextvars.ContextVar("tool_whitelist_context", default=None)
+)
 
 
 @dataclass(frozen=True)
@@ -1760,12 +1859,17 @@ def set_thread_tool_whitelist(
     allowed: Optional[Set[str]],
     deny_msg_fmt: str = "Tool '{tool_name}' denied: not in this thread's tool whitelist",
 ) -> None:
-    _thread_tool_whitelist.allowed = allowed
-    _thread_tool_whitelist.fmt = deny_msg_fmt
+    """Restrict tool dispatch in this execution context and propagated worker contexts."""
+    _tool_whitelist_context.set(
+        _ToolWhitelistContext(
+            allowed=None if allowed is None else frozenset(allowed),
+            deny_msg_fmt=deny_msg_fmt,
+        )
+    )
 
 
 def clear_thread_tool_whitelist() -> None:
-    _thread_tool_whitelist.allowed = None
+    _tool_whitelist_context.set(None)
 
 
 def _get_pre_tool_call_directive_details(
@@ -1777,10 +1881,14 @@ def _get_pre_tool_call_directive_details(
     the tool result) or ``{"action": "approve", "message", "rule_key"?}`` (escalate ANY tool to the
     human-approval gate; ``rule_key`` picks the ``[a]lways`` allowlist grain). First valid directive
     wins; irrelevant returns are ignored."""
-    allowed = getattr(_thread_tool_whitelist, "allowed", None)
-    if allowed is not None and tool_name not in allowed:
-        fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
-        return _PreToolCallDirective(action="block", message=fmt.format(tool_name=tool_name))
+    whitelist = _tool_whitelist_context.get()
+    if whitelist is not None and whitelist.allowed is not None and tool_name not in whitelist.allowed:
+        try:
+            message = whitelist.deny_msg_fmt.format(tool_name=tool_name)
+        except Exception:
+            logger.warning("Invalid tool-whitelist denial template; using fail-closed fallback")
+            message = f"Tool '{tool_name}' denied: not in this execution context's tool whitelist"
+        return _PreToolCallDirective(action="block", message=message)
     from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
     hook_results = invoke_lifecycle_hook(
         "pre_tool_call", tool_name=tool_name, args=args if isinstance(args, dict) else {},

@@ -220,17 +220,22 @@ class PluginLedgerMixin:
         return manifest_key(plugin) if isinstance(plugin, PluginManifest) else str(plugin)
 
     def unload(self, plugin: Union[str, PluginManifest, LoadedPlugin, None] = None) -> bool:
-        """Unload registrations while excluding discovery/deferred loading."""
+        """Unload registrations atomically with concurrent replacement registration."""
         with self._discovery_lock, _plugin_home_scope(self.home_path):
-            return self._unload_scoped(plugin)
+            with replacement_coordinator.transaction():
+                return self._unload_scoped(plugin)
 
     def _unload_scoped(self, plugin: Union[str, PluginManifest, LoadedPlugin, None] = None) -> bool:
         """Unload one plugin (or all when ``plugin=None``, as force rediscovery does). Every ledger registration
         — including on_unload callbacks and supervised tasks — is disposed in reverse acquisition order with
-        identity-conditional inverses. Returns ``True`` when anything was found."""
+        identity-conditional inverses. The caller holds the replacement transaction across target resolution,
+        invalidation, disposal, ledger forgetting, and manager cleanup. Returns ``True`` when anything was found."""
         unload_all = plugin is None
         if unload_all:
-            target_keys = set(self._ownership_ledger) | set(self._plugins)
+            target_keys = (
+                set(self._ownership_ledger) | set(self._plugins)
+                | set(self._plugin_context_generations)
+            )
             registrations = list(self._registration_order)
         else:
             target_keys = self._unload_target_keys(self._resolve_plugin_key(plugin))
@@ -242,6 +247,7 @@ class PluginLedgerMixin:
             registrations.extend(
                 r for key in target_keys for r in self._ownership_ledger.get(key, []) if r.persistent and r.active
             )
+        self._invalidate_plugin_contexts(target_keys)
         found = bool(target_keys or registrations)
         self._dispose_registrations(registrations)
         self._forget_registrations(registrations)
@@ -254,7 +260,10 @@ class PluginLedgerMixin:
 
     def _unload_target_keys(self, requested: str) -> Set[str]:
         """Resolve a targeted-unload request to canonical plugin keys (exact key, else by name)."""
-        if requested in self._ownership_ledger or requested in self._plugins:
+        if (
+            requested in self._ownership_ledger or requested in self._plugins
+            or requested in self._plugin_context_generations
+        ):
             return {requested}
         return {key for key, loaded in self._plugins.items() if loaded.manifest.name == requested}
 
@@ -294,6 +303,8 @@ class PluginLedgerMixin:
             self._platform_handler_factories,
         ):
             container.clear()
+        self._plugin_context_generations.clear()
+        self._plugin_context_registries.clear()
         self._context_engine = None
         with self._hook_timeout_lock:
             self._hook_running_callbacks.clear()

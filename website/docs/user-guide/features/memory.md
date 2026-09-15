@@ -363,24 +363,38 @@ Fork usage is persisted in `session_model_usage` with `task='background_review'`
 and a completion line is written to `agent.log`
 (`Background review complete: thread=bg-review calls=… in=… out=… result=…`).
 
-### Allowing a narrowly scoped extra review tool (`extra_tools`)
+### Applying changes or submitting proposals (`mode`)
 
-Background review can use memory, skill-management, and read-only file tools
-by default. If a profile provides another tool that is safe for unattended
-review, opt it in by name:
+Background review applies memory and skill changes directly by default. To make
+all review persistence proposal-only, configure a single human-gated proposal
+tool:
 
 ```yaml
 auxiliary:
   background_review:
+    mode: propose                 # apply (default) | propose
+    proposal_tool: propose_shared_memory
     extra_tools:
       - propose_shared_memory
 ```
 
-The tool must already be available to the parent agent; this setting only adds
-it to the review fork's runtime whitelist. It does not enable arbitrary tools,
-and tools not listed here remain denied. Keep the list narrow and prefer tools
-that stage a proposal for human review rather than applying external or
-destructive changes directly. The default is an empty list.
+In `propose` mode, the review can call only `proposal_tool` plus the read-only
+`skill_view`, `skills_list`, `read_file`, and `search_files` tools. Direct
+`memory` and `skill_manage` calls are blocked even if the parent advertises
+them. The proposal tool must have a non-empty name, be listed in `extra_tools`,
+and already be present in the parent session's tool schema. A missing or
+unavailable proposal tool stops the review before its model request instead of
+falling back to direct writes. Explicit `/refine` reviews follow the same mode.
+
+The default `apply` mode preserves the existing behavior: background review can
+use memory, skill-management, and read-only file tools. The `mode` key may be
+omitted only when `background_review` is a valid mapping. Explicit null, false,
+zero, empty, non-string, or unknown values—and an unreadable or malformed
+`background_review` block—stop the review before its fork or model request.
+`extra_tools` may admit additional named parent tools to the runtime whitelist.
+These settings never add or remove advertised tools from a running session; the
+review inherits the parent's tool schema unchanged so prompt-cache prefix parity
+is preserved.
 
 ### Local models: reviews wait for an idle GPU (`defer`)
 
@@ -413,6 +427,17 @@ review that has waited longer than `defer_max_age_s` runs even if the machine
 never goes idle. Explicit `/refine` always runs immediately. The queue is
 in-memory: reviews still pending when the app exits are dropped, same as an
 in-flight fork would have been.
+
+At idle dispatch Hermes reloads and validates the complete current
+`auxiliary.background_review` block. The queued snapshot and enqueue time are
+retained, but queued settings never retain execution authority: changes to
+`mode`, `proposal_tool`, `extra_tools`, routing, budgets, or any other review
+setting take effect before a fork is created. Switching `enabled` off drops the
+item. An unreadable or malformed config in a cold process, with no prior valid
+load, blocks visibly and fail-closed. If this process already loaded a valid
+config, the canonical config loader instead serves that last-known-good policy;
+the review may continue under that previous policy while the broken edit is
+reported and ignored until fixed.
 
 ## Controlling skill writes (`skills.write_approval`)
 

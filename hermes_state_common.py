@@ -200,7 +200,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})")
 
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
@@ -341,6 +341,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     hidden INTEGER NOT NULL DEFAULT 0,
     last_read_at REAL,
     tool_names TEXT,
+    model_tool_policy_version INTEGER,
+    model_tool_policy TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
@@ -474,6 +476,40 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS intrinsic_tool_approval_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    profile_identity TEXT NOT NULL,
+    profile_home TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    tool_call_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    original_args_sha256 TEXT NOT NULL,
+    preview_sha256 TEXT NOT NULL,
+    approval_scope_sha256 TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('approved', 'denied')),
+    decided_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    consumed_by TEXT,
+    consumed_at REAL,
+    CHECK (expires_at = decided_at + 900)
+);
+
+CREATE TRIGGER IF NOT EXISTS intrinsic_tool_approval_receipts_immutable
+BEFORE UPDATE OF receipt_id, profile_identity, profile_home, session_id, turn_id,
+                 tool_call_id, tool_name, original_args_sha256, preview_sha256,
+                 approval_scope_sha256, decision, decided_at, expires_at
+ON intrinsic_tool_approval_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'intrinsic approval receipt bindings are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS intrinsic_tool_approval_receipts_no_delete
+BEFORE DELETE ON intrinsic_tool_approval_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'intrinsic approval receipts cannot be deleted');
+END;
+
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,
     origin_session TEXT NOT NULL,
@@ -511,6 +547,14 @@ CREATE INDEX IF NOT EXISTS idx_messages_assistant_calls_by_session
     WHERE role = 'assistant' AND tool_calls IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires ON session_turn_leases(expires_at);
+CREATE INDEX IF NOT EXISTS idx_intrinsic_approval_receipts_session
+    ON intrinsic_tool_approval_receipts(session_id);
+CREATE INDEX IF NOT EXISTS idx_intrinsic_approval_receipts_tool_call
+    ON intrinsic_tool_approval_receipts(tool_call_id);
+CREATE INDEX IF NOT EXISTS idx_intrinsic_approval_receipts_scope
+    ON intrinsic_tool_approval_receipts(approval_scope_sha256);
+CREATE INDEX IF NOT EXISTS idx_intrinsic_approval_receipts_expiry
+    ON intrinsic_tool_approval_receipts(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery

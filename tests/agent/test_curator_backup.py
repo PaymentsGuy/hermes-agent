@@ -8,6 +8,7 @@ import os
 import sys
 import tarfile
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -486,8 +487,8 @@ def test_rollback_recovers_cleanly_from_a_partial_extract(backup_env, monkeypatc
     assert "current only" in (skills / "beta" / "SKILL.md").read_text(encoding="utf-8")
 
 
-def test_snapshot_excludes_git_and_curator_backups_and_hub(backup_env):
-    """Tar snapshots must exclude .git, .curator_backups, and .hub (top-level and nested)."""
+def test_snapshot_excludes_metadata_and_rollback_preserves_mutation_lock(backup_env):
+    """Snapshots and rollback must leave the live mutation-lock generation untouched."""
     cb = backup_env["cb"]
     skills = backup_env["skills"]
 
@@ -496,6 +497,9 @@ def test_snapshot_excludes_git_and_curator_backups_and_hub(backup_env):
     (skills / ".git" / "config").write_text("[core]\nrepositoryformatversion = 0\n", encoding="utf-8")
     (skills / ".hub").mkdir()
     (skills / ".hub" / "lock.json").write_text("{}", encoding="utf-8")
+    mutation_lock = skills / ".mutation.lock"
+    mutation_lock.write_bytes(b"same lock generation\n")
+    lock_inode = mutation_lock.stat().st_ino
 
     # Regular skill with nested .git
     _write_skill(skills, "alpha", body="alpha body")
@@ -512,14 +516,112 @@ def test_snapshot_excludes_git_and_curator_backups_and_hub(backup_env):
     with tarfile.open(archive, "r:gz") as tf:
         members = tf.getnames()
 
-    # Ensure no member contains .git, .curator_backups, or .hub
+    # Ensure no member contains excluded metadata, including the live lockfile.
     for name in members:
         parts = Path(name).parts
         assert ".git" not in parts, f".git found in archive: {name}"
         assert ".curator_backups" not in parts, f".curator_backups found in archive: {name}"
         assert ".hub" not in parts, f".hub found in archive: {name}"
+        assert ".mutation.lock" not in parts, f"mutation lock found in archive: {name}"
 
     assert "alpha/SKILL.md" in members
+
+    _write_skill(skills, "alpha", body="changed")
+    ok, msg, _ = cb.rollback(backup_id=snap_dir.name)
+    assert ok, msg
+    assert mutation_lock.stat().st_ino == lock_inode
+    assert mutation_lock.read_bytes() == b"same lock generation\n"
+
+
+def test_rollback_serializes_with_real_skill_manage_writer(backup_env, monkeypatch):
+    cb = backup_env["cb"]
+    skills = backup_env["skills"]
+    _write_skill(skills, "alpha", body="snapshot")
+    target = cb.snapshot_skills(reason="target")
+    assert target is not None
+    _write_skill(skills, "alpha", body="current")
+
+    from tools import skill_manager_tool as smt
+
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    rollback_entered = threading.Event()
+    release_rollback = threading.Event()
+    writer_attempted = threading.Event()
+    writer_body_entered = threading.Event()
+    real_snapshot = cb.snapshot_skills
+    real_writer = smt._skill_manage_unlocked
+
+    def paused_snapshot(*args, **kwargs):
+        if str(kwargs.get("reason", "")).startswith("pre-rollback"):
+            rollback_entered.set()
+            assert release_rollback.wait(5)
+        return real_snapshot(*args, **kwargs)
+
+    def observed_writer(*args, **kwargs):
+        writer_body_entered.set()
+        return real_writer(*args, **kwargs)
+
+    monkeypatch.setattr(cb, "snapshot_skills", paused_snapshot)
+    monkeypatch.setattr(smt, "_skill_manage_unlocked", observed_writer)
+    rollback_result = []
+    writer_result = []
+
+    rollback_thread = threading.Thread(
+        target=lambda: rollback_result.append(cb.rollback(target.name))
+    )
+
+    def write_skill():
+        writer_attempted.set()
+        writer_result.append(json.loads(smt.skill_manage(
+            action="create",
+            name="concurrent-writer",
+            content=(
+                "---\nname: concurrent-writer\n"
+                "description: Use when testing rollback serialization.\n"
+                "---\n\n# Concurrent writer\n"
+            ),
+        )))
+
+    writer_thread = threading.Thread(target=write_skill)
+    rollback_thread.start()
+    assert rollback_entered.wait(5)
+    writer_thread.start()
+    assert writer_attempted.wait(5)
+    assert not writer_body_entered.wait(0.5)
+
+    release_rollback.set()
+    rollback_thread.join(timeout=5)
+    writer_thread.join(timeout=5)
+    assert not rollback_thread.is_alive()
+    assert not writer_thread.is_alive()
+    assert rollback_result and rollback_result[0][0] is True, rollback_result
+    assert writer_result and writer_result[0]["success"] is True, writer_result
+    assert (skills / "concurrent-writer" / "SKILL.md").exists()
+
+
+def test_rollback_exception_releases_mutation_lock(backup_env, monkeypatch):
+    cb = backup_env["cb"]
+
+    def fail(_backup_id=None):
+        raise RuntimeError("rollback failed")
+
+    monkeypatch.setattr(cb, "_rollback_unlocked", fail)
+    with pytest.raises(RuntimeError, match="rollback failed"):
+        cb.rollback()
+
+    from tools.skill_mutation_lock import skill_mutation_lock
+
+    entered = threading.Event()
+
+    def acquire_after_failure():
+        with skill_mutation_lock():
+            entered.set()
+
+    thread = threading.Thread(target=acquire_after_failure)
+    thread.start()
+    thread.join(timeout=3)
+    assert entered.is_set()
+    assert not thread.is_alive()
 
 
 def test_rollback_preserves_top_level_git(backup_env):

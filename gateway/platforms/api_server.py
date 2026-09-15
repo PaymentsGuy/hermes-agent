@@ -2103,7 +2103,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         model_options: Optional[Dict[str, Any]] = None, route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
-        room_execution_policy: Optional[Dict[str, Any]] = None) -> Any:
+        room_execution_policy: Optional[Dict[str, Any]] = None,
+        model_tool_policy: Optional[Dict[str, Any]] = None) -> Any:
         """Create an AIAgent from the gateway runtime config + platform toolsets.
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
@@ -2155,7 +2156,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Same fallback provider chain as Telegram/Discord/Slack.
             "fallback_model": None if confirmed_runtime_lock else GatewayRunner._load_fallback_model(),
             "reasoning_config": request_reasoning_config,
-            "gateway_session_key": gateway_session_key}
+            "gateway_session_key": gateway_session_key,
+            "model_tool_policy": model_tool_policy}
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
         agent = AIAgent(**agent_kwargs)
@@ -2693,7 +2695,28 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # Full system prompts / model_config never cross the client API; only their presence.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
         payload["has_model_config"] = bool(session.get("model_config"))
+        try:
+            from agent.model_tool_policy import decode_stored_model_tool_policy, model_tool_policy_identity
+            policy = decode_stored_model_tool_policy(
+                session.get("model_tool_policy_version"), session.get("model_tool_policy"),
+            )
+            if policy is not None:
+                payload["model_tool_policy"] = model_tool_policy_identity(policy)
+        except ValueError:
+            payload["model_tool_policy"] = {"invalid": True}
         return payload
+
+    @staticmethod
+    def _validate_api_model_tool_policy(raw: Any) -> Optional[Dict[str, Any]]:
+        if raw is None:
+            return None
+        from agent.model_tool_policy import validate_model_tool_policy_for_eventual_surface
+        from gateway.run import _load_gateway_config
+        from hermes_cli.tools_config import _get_platform_tools
+        return validate_model_tool_policy_for_eventual_surface(
+            raw,
+            enabled_toolsets=sorted(_get_platform_tools(_load_gateway_config(), "api_server")),
+        )
 
     @staticmethod
     def _message_response(message: Dict[str, Any]) -> Dict[str, Any]:
@@ -2802,6 +2825,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if system_prompt is not None and not isinstance(system_prompt, str):
             return _error_response("system_prompt must be a string", 400, code="invalid_system_prompt")
         source = self._normalize_session_source(body.get("source") or "api_server")
+        try:
+            model_tool_policy = self._validate_api_model_tool_policy(
+                body.get("model_tool_policy") if "model_tool_policy" in body else None)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return _error_response(str(exc), 400, code="invalid_model_tool_policy")
         runtime_request = self._session_runtime_request_from_body(body)
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
@@ -2826,10 +2854,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return None, "exists"
             conn.execute(
                 """INSERT INTO sessions (
-                   id, source, model, model_config, system_prompt, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                   id, source, model, model_config, system_prompt, started_at,
+                   model_tool_policy_version, model_tool_policy
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (session_id, source, model_name, json.dumps(model_config) if model_config else None,
-                 system_prompt, time.time()))
+                 system_prompt, time.time(), 1 if model_tool_policy is not None else None,
+                 json.dumps(model_tool_policy, sort_keys=True, separators=(",", ":"))
+                 if model_tool_policy is not None else None))
             if title is not None:
                 clean_title = db.sanitize_title(str(title))
                 if clean_title:
@@ -2948,6 +2979,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         source, err = await self._get_existing_session_or_404(source_id)
         if err:
             return err
+        try:
+            from agent.model_tool_policy import MODEL_TOOL_POLICY_VERSION, decode_stored_model_tool_policy
+            model_tool_policy = decode_stored_model_tool_policy(
+                source.get("model_tool_policy_version"), source.get("model_tool_policy"),
+            )
+            if model_tool_policy is not None:
+                model_tool_policy = self._validate_api_model_tool_policy(model_tool_policy)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return _error_response(
+                f"Stored model-tool policy invalid: {exc}", 409, code="invalid_model_tool_policy")
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -2962,7 +3003,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         await asyncio.to_thread(db.end_session, source_id, "branched")
         await asyncio.to_thread(
             db.create_session, fork_id, "api_server", model=source.get("model"),
-            system_prompt=source.get("system_prompt"), parent_session_id=source_id)
+            system_prompt=source.get("system_prompt"), parent_session_id=source_id,
+            model_tool_policy=model_tool_policy,
+            model_tool_policy_version=(
+                MODEL_TOOL_POLICY_VERSION if model_tool_policy is not None else None
+            ))
         messages = await asyncio.to_thread(db.get_messages, source_id)
         await asyncio.to_thread(db.replace_messages, fork_id, messages)
         title = body.get("title")
@@ -2991,6 +3036,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
             return None, err
+        try:
+            from agent.model_tool_policy import decode_stored_model_tool_policy
+            model_tool_policy = decode_stored_model_tool_policy(
+                session.get("model_tool_policy_version"), session.get("model_tool_policy"),
+            )
+            if model_tool_policy is not None:
+                model_tool_policy = self._validate_api_model_tool_policy(model_tool_policy)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return None, _error_response(
+                f"Stored model-tool policy invalid: {exc}", 409, code="invalid_model_tool_policy")
         body, err = await self._read_json_body(request)
         if err:
             return None, err
@@ -3040,6 +3095,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active, turn_author=turn_author,
+            model_tool_policy=model_tool_policy,
             # #98619: the client addresses this session by construction — the id is in the
             # request path (/api/sessions/{session_id}/chat) — so a wake self-post lands where
             # the client will read it. The audited native-session opt-in.
@@ -3641,7 +3697,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None, session_model: Optional[str] = None,
         requested_runtime: Optional[Dict[str, Any]] = None, route_source: str = "global",
         confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
-        session_history_delivery: str = "", turn_author: Optional[Dict[str, Any]] = None) -> tuple:
+        session_history_delivery: str = "", turn_author: Optional[Dict[str, Any]] = None,
+        model_tool_policy: Optional[Dict[str, Any]] = None) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``agent_ref[0]`` receives the agent so SSE writers can interrupt it; ``active_run_id``
         registers it in ``_active_run_agents``. Under a confirmed model lock the actual
@@ -3673,7 +3730,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         tool_start_callback=tool_start_callback, tool_complete_callback=tool_complete_callback,
                         gateway_session_key=gateway_session_key, requested_model=requested_model,
                         requested_provider=requested_provider, model_options=model_options, route=route,
-                        session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
+                        session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
+                        model_tool_policy=model_tool_policy)
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if active_run_id:

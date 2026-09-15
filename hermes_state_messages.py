@@ -856,8 +856,10 @@ class SessionMessagesMixin:
             return session_id
         try:
             session_id = self.get_compression_tip(session_id) or session_id
-        except Exception:
-            pass
+        except Exception as exc:
+            from agent.model_tool_policy import ModelToolPolicyContinuityError
+            if isinstance(exc, ModelToolPolicyContinuityError):
+                raise
         with self._read_ctx() as conn:
             current = session_id
             seen = {current}

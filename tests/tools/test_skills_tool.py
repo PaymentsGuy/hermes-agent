@@ -1,5 +1,6 @@
 """Tests for tools/skills_tool.py — skill discovery and viewing."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -302,6 +303,378 @@ class TestSkillsList:
 
 
 class TestSkillView:
+    def test_raw_main_response_uses_one_byte_snapshot(self, tmp_path, monkeypatch):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "snapshot-skill", body="VERSION A")
+            skill_md = skill_dir / "SKILL.md"
+            version_a = skill_md.read_bytes()
+            version_b = version_a.replace(b"VERSION A", b"VERSION B")
+            original_read = skills_tool_module._read_authorized_file_bytes
+            snapshots = []
+
+            def replace_after_authorized_read(target, root):
+                data = original_read(target, root)
+                if target == skill_md:
+                    snapshots.append(data)
+                    skill_md.write_bytes(version_b)
+                return data
+
+            monkeypatch.setattr(
+                skills_tool_module,
+                "_read_authorized_file_bytes",
+                replace_after_authorized_read,
+            )
+            result = json.loads(
+                skill_view(
+                    "snapshot-skill",
+                    preprocess=False,
+                    raw_identity=True,
+                    raw_text=True,
+                )
+            )
+
+        assert snapshots == [version_a]
+        assert result["success"] is True
+        assert result["content"].encode("utf-8") == version_a
+        assert result["raw_text"].encode("utf-8") == version_a
+        assert result["raw_files"][0]["sha256"] == hashlib.sha256(version_a).hexdigest()
+
+    def test_raw_support_response_uses_one_byte_snapshot(self, tmp_path, monkeypatch):
+        from tools import skills_tool_plugin
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "snapshot-skill")
+            support = skill_dir / "references" / "snapshot.md"
+            support.parent.mkdir()
+            support.write_text("VERSION A", encoding="utf-8")
+            version_a = support.read_bytes()
+            version_b = b"VERSION B"
+            original_read = skills_tool_plugin._read_authorized_file_bytes
+            snapshots = []
+
+            def replace_after_authorized_read(target, root):
+                data = original_read(target, root)
+                if target == support:
+                    snapshots.append(data)
+                    support.write_bytes(version_b)
+                return data
+
+            monkeypatch.setattr(
+                skills_tool_plugin,
+                "_read_authorized_file_bytes",
+                replace_after_authorized_read,
+            )
+            result = json.loads(
+                skill_view(
+                    "snapshot-skill",
+                    file_path="references/snapshot.md",
+                    raw_identity=True,
+                    raw_text=True,
+                )
+            )
+
+        assert snapshots == [version_a]
+        assert result["success"] is True
+        assert result["content"].encode("utf-8") == version_a
+        assert result["raw_text"].encode("utf-8") == version_a
+        assert result["raw_files"][0]["sha256"] == hashlib.sha256(version_a).hexdigest()
+
+    @pytest.mark.parametrize("without_nofollow", [False, True], ids=["native", "fallback"])
+    def test_support_symlink_swap_at_open_never_serves_outside_bytes(
+        self, tmp_path, monkeypatch, without_nofollow
+    ):
+        from tools import skills_tool_plugin
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "snapshot-skill")
+            support = skill_dir / "references" / "snapshot.md"
+            support.parent.mkdir()
+            support.write_text("AUTHORIZED", encoding="utf-8")
+            outside = tmp_path / "outside.md"
+            outside.write_text("OUTSIDE", encoding="utf-8")
+            probe = tmp_path / "symlink-probe"
+            try:
+                probe.symlink_to(outside)
+                probe.unlink()
+            except (OSError, NotImplementedError) as exc:
+                pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+            nofollow = getattr(skills_tool_plugin.os, "O_NOFOLLOW", 0)
+            if without_nofollow:
+                monkeypatch.delattr(skills_tool_plugin.os, "O_NOFOLLOW", raising=False)
+            real_open = skills_tool_plugin.os.open
+            swapped = False
+            target_open_calls = 0
+            target_flags = []
+
+            def swap_immediately_before_open(path, flags, *args, **kwargs):
+                nonlocal swapped, target_open_calls
+                if Path(path) == support:
+                    target_open_calls += 1
+                    target_flags.append(flags)
+                    swapped = True
+                    support.unlink()
+                    support.symlink_to(outside)
+                return real_open(path, flags, *args, **kwargs)
+
+            monkeypatch.setattr(skills_tool_plugin.os, "open", swap_immediately_before_open)
+            result = json.loads(
+                skill_view(
+                    "snapshot-skill",
+                    file_path="references/snapshot.md",
+                    raw_identity=True,
+                    raw_text=True,
+                )
+            )
+
+        assert swapped is True
+        assert target_open_calls == 1
+        if without_nofollow or not nofollow:
+            assert all(not flags & nofollow for flags in target_flags)
+        else:
+            assert all(flags & nofollow for flags in target_flags)
+        assert result["success"] is False
+        assert result.get("content") != "OUTSIDE"
+        assert result.get("raw_text") != "OUTSIDE"
+        assert result.get("raw_files", [{}])[0].get("sha256") != hashlib.sha256(
+            b"OUTSIDE"
+        ).hexdigest()
+
+    @pytest.mark.parametrize(
+        "raw_args",
+        [
+            {"raw_identity": "false"},
+            {"raw_identity": 1},
+            {"raw_identity": 0},
+            {"raw_identity": []},
+            {"raw_identity": {}},
+            {"raw_text": "true", "raw_identity": True},
+            {"raw_text": 1, "raw_identity": True},
+            {"raw_text": 0, "raw_identity": True},
+            {"raw_text": [], "raw_identity": True},
+            {"raw_text": {}, "raw_identity": True},
+            {"raw_text": True},
+        ],
+    )
+    def test_registry_rejects_invalid_raw_flags_before_read_dedup_or_bump(
+        self, tmp_path, raw_args
+    ):
+        from tools.registry import registry
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "my-skill")
+            with (
+                patch(
+                    "tools.skills_tool._read_skill_text",
+                    wraps=skills_tool_module._read_skill_text,
+                ) as read_text,
+                patch("tools.skills_tool._read_authorized_file_bytes") as read_bytes,
+                patch(
+                    "tools.skills_tool._check_skill_view_dedup", return_value=None
+                ) as check_dedup,
+                patch("tools.skills_tool._record_skill_view") as record_view,
+                patch("tools.skill_usage.bump_view") as bump_view,
+                patch("tools.skill_usage.bump_use") as bump_use,
+            ):
+                result = json.loads(
+                    registry.dispatch(
+                        "skill_view",
+                        {"name": "my-skill", **raw_args},
+                        task_id="invalid-raw",
+                    )
+                )
+
+        assert result["success"] is False
+        assert "boolean" in result["error"] or "requires raw_identity" in result["error"]
+        read_text.assert_not_called()
+        read_bytes.assert_not_called()
+        check_dedup.assert_not_called()
+        record_view.assert_not_called()
+        bump_view.assert_not_called()
+        bump_use.assert_not_called()
+
+    def test_raw_main_file_identity_and_text_ignore_rendering(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        skill_dir = skills_dir / "_org" / "org-1" / "devops" / "raw-skill"
+        skill_dir.mkdir(parents=True)
+        (skills_dir / "_org" / ".active_org").write_text("org-1\n", encoding="utf-8")
+        (skills_dir / "_org" / "org-1" / ".org-provenance.json").write_text(
+            json.dumps({"author_device": "device-a", "ts": "2026-09-13T00:00:00Z"}),
+            encoding="utf-8",
+        )
+        raw_bytes = (
+            "---\r\nname: raw-skill\r\ndescription: Exact bytes.\r\n---\r\n\r\n"
+            "Session ${HERMES_SESSION_ID}; decomposed e\u0301; snowman \u2603.\r\n"
+        ).encode("utf-8")
+        (skill_dir / "SKILL.md").write_bytes(raw_bytes)
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+            default = json.loads(skill_view("raw-skill", task_id="session-raw"))
+            result = json.loads(
+                skill_view(
+                    "raw-skill",
+                    task_id="session-raw",
+                    raw_identity=True,
+                    raw_text=True,
+                )
+            )
+
+        assert "raw_files" not in default
+        assert "raw_text" not in default
+        assert result["content"] == default["content"]
+        assert result["content"].startswith("> [!NOTE] ORG-SHARED SKILL")
+        assert "Session session-raw" in result["content"]
+        assert result["raw_text"] == raw_bytes.decode("utf-8", errors="strict")
+        assert result["raw_text"].encode("utf-8") == raw_bytes
+        assert result["raw_files"] == [
+            {
+                "path": "SKILL.md",
+                "byte_length": len(raw_bytes),
+                "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                "state": "present",
+            }
+        ]
+
+    def test_raw_support_file_round_trips_exact_unicode_and_newlines(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "my-skill")
+            support = skill_dir / "references" / "exact.md"
+            support.parent.mkdir()
+            raw_bytes = b"\xef\xbb\xbf" + "alpha\r\n\u03b2eta\ne\u0301\rfinal".encode("utf-8")
+            support.write_bytes(raw_bytes)
+            result = json.loads(
+                skill_view(
+                    "my-skill",
+                    file_path="references/./exact.md",
+                    raw_identity=True,
+                    raw_text=True,
+                )
+            )
+
+        assert result["success"] is True
+        assert result["file"] == "references/./exact.md"
+        assert result["content"] == "alpha\n\u03b2eta\ne\u0301\nfinal"
+        assert result["raw_text"].startswith("\ufeffalpha\r\n")
+        assert result["raw_text"].encode("utf-8") == raw_bytes
+        assert result["raw_files"] == [
+            {
+                "path": "references/exact.md",
+                "byte_length": len(raw_bytes),
+                "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                "state": "present",
+            }
+        ]
+
+    def test_raw_text_requires_identity_and_invalid_utf8_fails_closed(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "my-skill")
+            support = skill_dir / "references" / "invalid.md"
+            support.parent.mkdir()
+            raw_bytes = b"valid-prefix\n\xff\xfe"
+            support.write_bytes(raw_bytes)
+            missing_identity = json.loads(skill_view("my-skill", raw_text=True))
+            identity_only = json.loads(
+                skill_view(
+                    "my-skill",
+                    file_path="references/invalid.md",
+                    raw_identity=True,
+                )
+            )
+            strict_text = json.loads(
+                skill_view(
+                    "my-skill",
+                    file_path="references/invalid.md",
+                    raw_identity=True,
+                    raw_text=True,
+                )
+            )
+
+        assert missing_identity["success"] is False
+        assert "raw_text requires raw_identity" in missing_identity["error"]
+        assert identity_only["success"] is True
+        assert identity_only["raw_files"][0]["sha256"] == hashlib.sha256(raw_bytes).hexdigest()
+        assert "raw_text" not in identity_only
+        assert strict_text["success"] is False
+        assert "UTF-8" in strict_text["error"]
+
+    def test_raw_flags_preserve_missing_traversal_symlink_and_protected_guards(
+        self, tmp_path, monkeypatch
+    ):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "protected-skill")
+            refs = skill_dir / "references"
+            refs.mkdir()
+            outside = tmp_path / "outside.md"
+            outside.write_text("outside", encoding="utf-8")
+            link = refs / "escape.md"
+            try:
+                link.symlink_to(outside)
+            except (OSError, NotImplementedError) as exc:
+                pytest.skip(f"symlinks unavailable in test environment: {exc}")
+            monkeypatch.setattr(
+                "tools.skill_usage.PROTECTED_BUILTIN_SKILLS", {"protected-skill"}
+            )
+
+            protected = json.loads(
+                skill_view("protected-skill", raw_identity=True, raw_text=True)
+            )
+            missing = json.loads(
+                skill_view(
+                    "protected-skill",
+                    file_path="references/missing.md",
+                    raw_identity=True,
+                )
+            )
+            traversal = json.loads(
+                skill_view(
+                    "protected-skill",
+                    file_path="../outside.md",
+                    raw_identity=True,
+                )
+            )
+            symlink = json.loads(
+                skill_view(
+                    "protected-skill",
+                    file_path="references/escape.md",
+                    raw_identity=True,
+                )
+            )
+
+        assert protected["success"] is True
+        assert protected["raw_files"][0]["state"] == "present"
+        assert missing["success"] is False and "not found" in missing["error"]
+        assert traversal["success"] is False and "traversal" in traversal["error"].lower()
+        assert symlink["success"] is False and "escapes" in symlink["error"].lower()
+
+    def test_registered_schema_and_handler_expose_boolean_raw_flags(self, tmp_path):
+        from tools.registry import registry
+
+        entry = registry.get_entry("skill_view")
+        properties = entry.schema["parameters"]["properties"]
+        assert properties["raw_identity"]["type"] == "boolean"
+        assert properties["raw_text"]["type"] == "boolean"
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("tools.skills_tool._check_skill_view_dedup") as check_dedup,
+            patch("tools.skills_tool._record_skill_view") as record_view,
+            patch("tools.skill_usage.bump_view") as bump_view,
+            patch("tools.skill_usage.bump_use") as bump_use,
+        ):
+            skill_dir = _make_skill(tmp_path, "my-skill")
+            raw_bytes = (skill_dir / "SKILL.md").read_bytes()
+            result = json.loads(
+                entry.handler(
+                    {"name": "my-skill", "raw_identity": True, "raw_text": True},
+                    task_id="schema-raw",
+                )
+            )
+        assert result["raw_text"].encode("utf-8") == raw_bytes
+        check_dedup.assert_not_called()
+        record_view.assert_not_called()
+        bump_view.assert_called_once_with("my-skill")
+        bump_use.assert_called_once()
+
     def test_view_resolves_by_dir_name_and_frontmatter_name(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(

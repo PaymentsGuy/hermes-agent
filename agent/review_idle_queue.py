@@ -64,6 +64,7 @@ class _PendingReview:
     session_key: str
     kwargs: Dict[str, Any]
     enqueued_at: float
+    run_in_context: Callable[..., Any]
 
 
 class ReviewIdleQueue:
@@ -95,10 +96,28 @@ class ReviewIdleQueue:
     def enqueue(self, agent: Any, session_key: str, kwargs: Dict[str, Any]) -> None:
         """Add (or replace — newest snapshot wins) a session's pending review, keeping the ORIGINAL
         enqueue time on coalesce so a busy session cannot push its age-out forever."""
+        from tools.thread_context import propagate_context_to_thread
+
+        capture_error = None
         with self._lock:
-            existing = self._pending.get(session_key)
-            enqueued_at = existing.enqueued_at if existing is not None else self._now()
-            self._pending[session_key] = _PendingReview(agent, session_key, kwargs, enqueued_at)
+            try:
+                run_in_context = propagate_context_to_thread(lambda operation: operation())
+            except Exception as e:  # noqa: BLE001 — stale work must not survive a failed replacement
+                self._pending.pop(session_key, None)
+                capture_error = e
+            else:
+                existing = self._pending.get(session_key)
+                enqueued_at = existing.enqueued_at if existing is not None else self._now()
+                self._pending[session_key] = _PendingReview(
+                    agent, session_key, dict(kwargs), enqueued_at, run_in_context
+                )
+        if capture_error is not None:
+            logger.warning(
+                "Deferred review blocked: enqueue context capture failed (session=%s): %s",
+                session_key[-12:], capture_error,
+            )
+            self._notify_failure(agent, capture_error)
+            return
         self._ensure_thread()
         self._wake.set()
         logger.info("Background review deferred (session=%s, queued=%d)", session_key[-12:], len(self._pending))
@@ -149,30 +168,64 @@ class ReviewIdleQueue:
             try:
                 item = self._pop_dispatchable()
                 if item is not None:
-                    if not self._still_enabled(item):
-                        logger.info(
-                            "Deferred background review dropped: reviews were disabled while it was queued (session=%s)",
-                            item.session_key[-12:])
-                        continue
-                    logger.info(
-                        "Dispatching deferred background review (session=%s, waited=%.0fs, queued=%d)",
-                        item.session_key[-12:], self._now() - item.enqueued_at, self.pending_count())
-                    item.agent._spawn_background_review_now(**item.kwargs)
+                    self._dispatch(item)
             except Exception:  # noqa: BLE001 — dispatcher must survive anything
                 logger.warning("Deferred review dispatch failed", exc_info=True)
             if item is None:
                 time.sleep(_POLL_INTERVAL_S)
 
-    @staticmethod
-    def _still_enabled(item: _PendingReview) -> bool:
-        """Re-check the enabled gate at DISPATCH time (disabling reviews while queued must stick). Fail-open."""
+    def _dispatch(self, item: _PendingReview) -> None:
+        """Enter the enqueueing context before any policy reload or spawn work."""
         try:
-            from agent.background_review import load_background_review_settings
+            item.run_in_context(lambda: self._dispatch_in_context(item))
+        except Exception as e:  # noqa: BLE001 — never retry in the dispatcher's default context
+            logger.warning(
+                "Deferred review blocked: enqueue context entry failed (session=%s): %s",
+                item.session_key[-12:], e,
+            )
+            self._notify_failure(item.agent, e)
 
-            return load_background_review_settings()[0]
-        except Exception:  # noqa: BLE001
-            return True
+    def _dispatch_in_context(self, item: _PendingReview) -> None:
+        """Reload current review policy and dispatch only after canonical preflight."""
+        from agent.background_review import (
+            _proposal_tool,
+            load_background_review_settings,
+        )
 
+        try:
+            enabled, task_cfg = load_background_review_settings()
+            if not enabled:
+                logger.info(
+                    "Deferred background review dropped: reviews were disabled while it was queued (session=%s)",
+                    item.session_key[-12:],
+                )
+                return
+            # This is the same mode/proposal-tool preflight used by immediate reviews. Run it
+            # before creating a review run/thread so stale queued authority can never reach a fork.
+            _proposal_tool(item.agent, task_cfg)
+        except Exception as e:  # noqa: BLE001 — config/load preflight failures are deny decisions
+            logger.warning(
+                "Deferred background review blocked by current policy (session=%s): %s",
+                item.session_key[-12:],
+                e,
+            )
+            self._notify_failure(item.agent, e)
+            return
+
+        kwargs = dict(item.kwargs)
+        kwargs["task_cfg"] = task_cfg
+        logger.info(
+            "Dispatching deferred background review (session=%s, waited=%.0fs, queued=%d)",
+            item.session_key[-12:], self._now() - item.enqueued_at, self.pending_count(),
+        )
+        item.agent._spawn_background_review_now(**kwargs)
+
+    @staticmethod
+    def _notify_failure(agent: Any, error: Exception) -> None:
+        try:
+            agent._emit_auxiliary_failure("background review", error)
+        except Exception:  # noqa: BLE001 — the dispatcher must survive notification failure
+            logger.debug("Deferred review failure notification failed", exc_info=True)
 
 def _managed_server_idle() -> bool:
     """No processing slot on any loaded model of the managed router; unreachable/no state file reads idle."""

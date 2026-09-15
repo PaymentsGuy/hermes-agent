@@ -424,3 +424,89 @@ def test_unrouted_review_fork_inherits_empty_tool_surface():
         assert added == set()
         assert fork.tools == []
         assert fork.valid_tool_names == set()
+
+
+def _model_tool_policy(*allowed):
+    return {
+        "policy_id": "review-policy",
+        "policy_sha256": "e" * 64,
+        "allowed_tools": list(allowed),
+        "approval_required_tools": list(allowed[:1]),
+    }
+
+
+def test_cache_parity_and_routed_review_forks_inherit_exact_full_policy():
+    import run_agent
+    import agent.background_review as bg_review
+
+    parent = _make_agent_stub(run_agent.AIAgent)
+    parent.model_tool_policy = _model_tool_policy("read_file")
+    parent.tools = [{"type": "function", "function": {"name": "read_file"}}]
+    captured = []
+
+    class Recorder(_make_recorder_class()):
+        def __init__(self, *args, **kwargs):
+            captured.append(dict(kwargs))
+            super().__init__(*args, **kwargs)
+            self.model_tool_policy = kwargs.get("model_tool_policy")
+
+    routed_runtime = {
+        "provider": "openrouter", "model": "routed-model", "api_key": "test-key",
+        "base_url": None, "api_mode": None, "credential_pool": None,
+        "request_overrides": {}, "max_tokens": None, "command": None, "args": [],
+        "routed": True,
+    }
+    with patch.object(run_agent, "AIAgent", Recorder):
+        cache_fork, _runtime, routed = bg_review.build_cache_parity_fork(
+            parent, max_iterations=5
+        )
+        assert not routed
+        with patch.object(bg_review, "_resolve_review_runtime", return_value=routed_runtime):
+            routed_fork, _runtime, routed = bg_review.build_cache_parity_fork(
+                parent, max_iterations=5
+            )
+
+    assert routed
+    assert [kwargs["model_tool_policy"] for kwargs in captured] == [
+        parent.model_tool_policy, parent.model_tool_policy,
+    ]
+    assert all(kwargs["model_tool_policy"] is not parent.model_tool_policy for kwargs in captured)
+    assert cache_fork.model_tool_policy == parent.model_tool_policy
+    assert routed_fork.model_tool_policy == parent.model_tool_policy
+
+
+def test_policy_bound_cache_parity_fork_stays_exact_across_mcp_refresh_and_corruption_fails_before_build():
+    import pytest
+    import run_agent
+    import agent.background_review as bg_review
+    from tools.mcp_tool_agent import refresh_agent_mcp_tools
+
+    parent = _make_agent_stub(run_agent.AIAgent)
+    parent.model_tool_policy = _model_tool_policy("read_file")
+    parent.tools = [{"type": "function", "function": {"name": "read_file"}}]
+
+    class Recorder(_make_recorder_class()):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.model_tool_policy = kwargs.get("model_tool_policy")
+
+    with patch.object(run_agent, "AIAgent", Recorder):
+        fork, _runtime, routed = bg_review.build_cache_parity_fork(parent, max_iterations=5)
+        before = list(fork.tools)
+        assert not routed
+        assert refresh_agent_mcp_tools(fork, content_aware=True) == set()
+
+    assert fork.model_tool_policy == parent.model_tool_policy
+    assert fork.tools == before
+    assert [tool["function"]["name"] for tool in fork.tools] == ["read_file"]
+
+    parent.model_tool_policy = {"policy_id": "corrupt"}
+    with patch.object(run_agent, "AIAgent") as constructor:
+        with pytest.raises(ValueError, match="fields are closed"):
+            bg_review.build_cache_parity_fork(parent, max_iterations=5)
+    constructor.assert_not_called()
+
+    parent.model_tool_policy = None
+    with patch.object(run_agent, "AIAgent", Recorder):
+        legacy, _runtime, _routed = bg_review.build_cache_parity_fork(parent, max_iterations=5)
+    assert legacy.model_tool_policy is None

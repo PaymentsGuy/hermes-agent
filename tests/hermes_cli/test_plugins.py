@@ -2323,6 +2323,7 @@ class TestPluginDispatchTool:
         mgr._cli_ref = mock_cli
 
         explicit_agent = MagicMock(name="explicit_agent")
+        explicit_agent.model_tool_policy = None
 
         mock_registry = MagicMock()
         mock_registry.dispatch.return_value = '{"ok": true}'
@@ -2332,6 +2333,48 @@ class TestPluginDispatchTool:
 
         call_kwargs = mock_registry.dispatch.call_args
         assert call_kwargs[1]["parent_agent"] is explicit_agent
+
+    def test_dispatch_tool_denies_parent_policy_before_registry(self):
+        mgr = PluginManager()
+        ctx = PluginContext(PluginManifest(name="test-plugin", source="user"), mgr)
+        agent = MagicMock()
+        agent.model_tool_policy = {
+            "policy_id": "fixture",
+            "policy_sha256": "1" * 64,
+            "allowed_tools": ["read_file"],
+            "approval_required_tools": [],
+        }
+        mgr._cli_ref = MagicMock(agent=agent)
+        mock_registry = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry):
+            result = ctx.dispatch_tool("skill_manage", {"operations": []})
+
+        assert "not allowed" in json.loads(result)["error"]
+        mock_registry.dispatch.assert_not_called()
+
+    def test_dispatch_tool_allows_tool_in_parent_policy(self):
+        mgr = PluginManager()
+        ctx = PluginContext(PluginManifest(name="test-plugin", source="user"), mgr)
+        agent = MagicMock()
+        agent.model_tool_policy = {
+            "policy_id": "fixture",
+            "policy_sha256": "1" * 64,
+            "allowed_tools": ["read_file"],
+            "approval_required_tools": [],
+        }
+        mgr._cli_ref = MagicMock(agent=agent)
+        mock_registry = MagicMock()
+        mock_registry.dispatch.return_value = '{"ok": true}'
+
+        with patch("tools.registry.registry", mock_registry):
+            result = ctx.dispatch_tool("read_file", {"path": "fixture"})
+
+        assert result == '{"ok": true}'
+        mock_registry.dispatch.assert_called_once_with(
+            "read_file", {"path": "fixture"},
+            scope=mgr.scope_key, parent_agent=agent,
+        )
 
 
 class TestPluginDebugLogging:

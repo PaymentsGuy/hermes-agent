@@ -1499,6 +1499,26 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _preserve_malformed_background_review(
+    merged: Dict[str, Any], explicit: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Keep an explicit non-mapping task visible to its runtime owner.
+
+    ``_deep_merge`` deliberately ignores null overrides of mapping defaults. That remains the
+    global contract; only ``auxiliary.background_review`` needs presence-sensitive validation.
+    """
+    explicit_aux = explicit.get("auxiliary")
+    if not isinstance(explicit_aux, dict) or "background_review" not in explicit_aux:
+        return merged
+    task = explicit_aux["background_review"]
+    if isinstance(task, dict):
+        return merged
+    merged_aux = merged.get("auxiliary")
+    if isinstance(merged_aux, dict):
+        merged_aux["background_review"] = copy.deepcopy(task)
+    return merged
+
+
 def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
     """Remove dotted leaf keys from *cfg* in place -> ``(cfg, keys_actually_present)``.
     ``save_config`` drops managed-scope leaves this way so a bulk write never persists a user
@@ -2146,7 +2166,10 @@ def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], An
     if isinstance(managed_normalized.get("model"), str):
         managed_normalized = dict(managed_normalized)
         managed_normalized["model"] = {"default": managed_normalized["model"]}
-    return _deep_merge(expanded, _expand_env_vars(managed_normalized)), managed_config
+    managed_expanded = _expand_env_vars(managed_normalized)
+    assert isinstance(managed_expanded, dict)
+    merged = _deep_merge(expanded, managed_expanded)
+    return _preserve_malformed_background_review(merged, managed_normalized), managed_config
 
 
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
@@ -2169,6 +2192,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        cold_config_fallback = False
 
         if user_sig is not None:
             try:
@@ -2182,14 +2206,23 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     user_config["agent"] = agent_user_config
                     user_config.pop("max_turns", None)
 
-                config = _deep_merge(config, user_config)
+                config = _preserve_malformed_background_review(
+                    _deep_merge(config, user_config), user_config
+                )
             except Exception as e:
                 lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e)
                 if lkg_copy is not None:
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
+                cold_config_fallback = True
 
         normalized = _canonicalize_config(config)
         expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
+        if cold_config_fallback:
+            # Defaults keep legacy apply behavior for valid/omitted config, but cannot grant
+            # mutation authority when the real user config was unreadable and no LKG exists.
+            auxiliary = expanded.get("auxiliary")
+            if isinstance(auxiliary, dict):
+                auxiliary["background_review"] = None
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # The cache stores its own deepcopy so load_config() callers can mutate freely while

@@ -228,14 +228,19 @@ def _billing_pending_change(result: dict) -> dict:
 
 # ── session.create / list / most_recent / facts ──────────────────────
 def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list, *, source, cwd, profile_name,
-                    copy_fields=(), compensate: bool = False) -> None:
+                    copy_fields=(), compensate: bool = False, model_tool_policy=None) -> None:
     """Branch child row + parent transcript (bounded-chunk transactions) + title. ``_branched_from`` keeps the
     row visible in list_sessions_rich() (the live parent never matches the legacy end_reason='branched'
     heuristic); NULL ``profile_name`` rows drop out of profile-keyed sidebar matching / deep links. ``compensate``
     deletes a committed row whose transcript/title failed (a durable-but-empty row would defeat the INSERT OR
     IGNORE first-prompt seed) — except on disk-full, where the delete cannot land."""
-    db.create_session(new_key, source=source, model=_resolve_model(), model_config={"_branched_from": parent_key},
-                      parent_session_id=parent_key, cwd=cwd, profile_name=profile_name)
+    from agent.model_tool_policy import MODEL_TOOL_POLICY_VERSION
+    db.create_session(
+        new_key, source=source, model=_resolve_model(), model_config={"_branched_from": parent_key},
+        parent_session_id=parent_key, cwd=cwd, profile_name=profile_name,
+        model_tool_policy=model_tool_policy,
+        model_tool_policy_version=(MODEL_TOOL_POLICY_VERSION if model_tool_policy is not None else None),
+    )
     try:
         # Compensation guard (#93959 review): if the transcript copy or title write fails AFTER the row
         # committed, the durable-but-empty row would defeat the lazy first-prompt fallback
@@ -268,11 +273,14 @@ def _seed_branch_row(record: dict, key: str, parent_session_id: str, history: li
                 return
             _persist_branch(db, key, parent_session_id, _branch_title(db, parent_session_id), history,
                             source=source, cwd=record["cwd"],
-                            profile_name=profile_name_for_home(profile_home) or _current_profile_name(), compensate=True)
+                            profile_name=profile_name_for_home(profile_home) or _current_profile_name(), compensate=True,
+                            model_tool_policy=record.get("model_tool_policy"))
             record["pending_title"] = None
             # The first submit's _persist_branch_seed is the fallback for a failed seed, not a second copy.
             record["_branch_seed_persisted"] = True
     except Exception:
+        if record.get("model_tool_policy") is not None:
+            raise
         logger.warning("seeded-branch persistence failed for %s; falling back to lazy row creation", key,
                        exc_info=True)
 
@@ -322,8 +330,96 @@ def _create_overrides(params: dict) -> tuple:
     return model_override, reasoning_override, service_tier_override
 
 
+def _create_model_tool_policy(params: dict, *, source: str, profile_home):
+    """Validate a declared policy against this session's exact available schema."""
+    if "model_tool_policy" not in params:
+        return None
+    from agent.model_tool_policy import validate_model_tool_policy_for_eventual_surface
+    with _profile_build_scope(profile_home):
+        platform = _resolve_agent_platform(source)
+        return validate_model_tool_policy_for_eventual_surface(
+            params.get("model_tool_policy"), enabled_toolsets=_load_enabled_toolsets(platform),
+        )
+
+
+def _validated_session_model_tool_policy(session: dict, db=None):
+    """Resolve exact live/durable policy state and revalidate it for the next agent surface."""
+    from agent.model_tool_policy import (
+        MODEL_TOOL_POLICY_VERSION, decode_model_tool_policy_carrier,
+        decode_stored_model_tool_policy,
+    )
+    live = decode_model_tool_policy_carrier(
+        session.get("model_tool_policy_version"), session.get("model_tool_policy"),
+    )
+    row = None
+    if db is not None and session.get("session_key"):
+        row = db.get_session(session["session_key"])
+    stored = (
+        decode_stored_model_tool_policy(
+            row.get("model_tool_policy_version"), row.get("model_tool_policy"),
+        ) if row is not None else None
+    )
+    if live is not None and stored is not None and live != stored:
+        raise ValueError("live and stored model-tool policy do not match")
+    if row is not None and (live is None) != (stored is None):
+        if stored is None:
+            raise ValueError("live model-tool policy is missing its durable declaration")
+        live = stored
+    policy = live if live is not None else stored
+    if policy is not None:
+        policy = _create_model_tool_policy(
+            {"model_tool_policy": policy}, source=_session_source(session),
+            profile_home=session.get("profile_home"),
+        )
+        session["model_tool_policy"] = policy
+        session["model_tool_policy_version"] = MODEL_TOOL_POLICY_VERSION
+    return policy
+
+
+def _branch_model_tool_policy(params: dict, *, parent_session_id: str | None, source: str, profile_home):
+    """A branch inherits its parent's exact declaration; it cannot introduce a new one."""
+    if not parent_session_id:
+        return _create_model_tool_policy(params, source=source, profile_home=profile_home)
+    with _session_db({"profile_home": str(profile_home) if profile_home is not None else None}) as db:
+        get_session = getattr(db, "get_session", None) if db is not None else None
+        if not callable(get_session):
+            if "model_tool_policy" in params:
+                raise ValueError("branch parent policy cannot be verified")
+            return None
+        parent = get_session(parent_session_id)
+        if not isinstance(parent, dict):
+            raise ValueError("branch parent session not found")
+        inherited = _validated_session_model_tool_policy(
+            {**parent, "session_key": parent_session_id, "profile_home": str(profile_home) if profile_home else None},
+            db,
+        )
+    if "model_tool_policy" in params:
+        supplied = _create_model_tool_policy(params, source=source, profile_home=profile_home)
+        if supplied != inherited:
+            raise ValueError("branch model-tool policy must exactly match its parent")
+    return inherited
+
+
+def _persist_policy_session(record: dict) -> None:
+    """Eagerly persist policy-bound drafts: authority must survive a restart before prompt one."""
+    from agent.model_tool_policy import MODEL_TOOL_POLICY_VERSION
+    with _session_db(record) as db:
+        if db is None:
+            raise RuntimeError("session database unavailable")
+        db.create_session(
+            record["session_key"], source=record["source"], model=_resolve_model(),
+            cwd=_persisted_session_cwd(record),
+            profile_name=profile_name_for_home(record.get("profile_home")) or _current_profile_name(),
+            model_tool_policy=record["model_tool_policy"],
+            model_tool_policy_version=MODEL_TOOL_POLICY_VERSION,
+        )
+    record["model_tool_policy_version"] = MODEL_TOOL_POLICY_VERSION
+
+
 @method("session.create")
 def _(rid, params: dict) -> dict:
+    from agent.model_tool_policy import MODEL_TOOL_POLICY_VERSION
+
     (sid, source), key = _new_runtime_ids(params), _new_session_key()
     history = _coerce_seed_history(params.get("messages"))
     # Branch: links back so list_sessions_rich keeps it visible and the sidebar nests it.
@@ -336,6 +432,12 @@ def _(rid, params: dict) -> dict:
     _enable_gateway_prompts()
     # ``profile`` (app-global remote mode): stored so the build and every turn re-bind HERMES_HOME.
     profile_home = _profile_home(profile := (params.get("profile") or "").strip() or None)
+    try:
+        model_tool_policy = _branch_model_tool_policy(
+            params, parent_session_id=parent_session_id, source=source, profile_home=profile_home,
+        )
+    except (TypeError, ValueError, RuntimeError) as exc:
+        return _err(rid, 4027, str(exc))
     session_model_override, create_reasoning_override, create_service_tier_override = _create_overrides(params)
     now = time.time()
     with _sessions_lock:
@@ -349,6 +451,9 @@ def _(rid, params: dict) -> dict:
             "seeded": bool(history),  # gates _persist_branch_seed: only create-time history is unpersisted
             "cwd": _completion_cwd(params), "inflight_turn": None, "last_active": now,
             "model_override": session_model_override,
+            "model_tool_policy": model_tool_policy,
+            "model_tool_policy_version": (
+                MODEL_TOOL_POLICY_VERSION if model_tool_policy is not None else None),
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
             "parent_session_id": parent_session_id, "pending_title": _str_param(params, "title") or None,
@@ -359,6 +464,13 @@ def _(rid, params: dict) -> dict:
             "slash_worker": None, "tool_progress_mode": _load_tool_progress_mode(), "tool_started_at": {},
             "transport": current_transport() or _stdio_transport}
         _register_session_cwd(_sessions[sid])
+    if model_tool_policy is not None and not (parent_session_id and history):
+        try:
+            _persist_policy_session(_sessions[sid])
+        except Exception as exc:
+            with _sessions_lock:
+                _sessions.pop(sid, None)
+            return _err(rid, 5027, f"model-tool policy persistence failed: {exc}")
     # No DB row here (drafts left "Untitled" litter): created on the first prompt — except seeded sessions.
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop launch (and every "New agent" /
     # draft) opens a session here just to paint the composer, so eagerly creating a row left an "Untitled"
@@ -376,7 +488,12 @@ def _(rid, params: dict) -> dict:
     # already written): the transcript exists only in memory, so a restart before the first prompt lost it
     # and the post-create resume 404'd. Persist it up front too; only empty drafts stay lazy.
     if parent_session_id and history:
-        _seed_branch_row(_sessions[sid], key, parent_session_id, history, source, profile_home)
+        try:
+            _seed_branch_row(_sessions[sid], key, parent_session_id, history, source, profile_home)
+        except Exception as exc:
+            with _sessions_lock:
+                _sessions.pop(sid, None)
+            return _err(rid, 5027, f"model-tool policy branch persistence failed: {exc}")
     elif history:
         _seed_row(_sessions[sid])
     # Return immediately so Ink can paint; the AIAgent builds right after the flush.
@@ -392,7 +509,11 @@ def _(rid, params: dict) -> dict:
                  **({"provider": override["provider"]} if override.get("provider") else {}),
                  "tools": {}, "skills": {}, "cwd": cwd, "branch": git_probe.branch(cwd),
                  "project": _project_info_for_cwd(cwd), "lazy": True, "desktop_contract": DESKTOP_BACKEND_CONTRACT,
-                 "profile_name": _response_profile_name(profile)}})
+                 "profile_name": _response_profile_name(profile),
+                 **({"model_tool_policy": __import__(
+                     "agent.model_tool_policy", fromlist=["model_tool_policy_identity"]
+                 ).model_tool_policy_identity(model_tool_policy)}
+                    if model_tool_policy is not None else {})}})
 
 
 def _session_list_by_title(rid, db, title_lookup: str) -> dict:
@@ -485,6 +606,7 @@ class _Resume:
         self.rid, self.params, self.target = rid, params, target
         self.db, self.owns_db, self.found, self.profile_resume_cwd = None, False, None, ""
         self.cols = _int_param(params, "cols", 80)
+        self.model_tool_policy = None
         # ``profile`` (app-global remote mode): resume from another local profile's state.db.
         self.profile = (params.get("profile") or "").strip() or None
         self.profile_home = _profile_home(self.profile)
@@ -506,7 +628,7 @@ class _Resume:
             extra.update(model_override=overrides.get("model_override"), resume_runtime_overrides=overrides or None)
         return _deferred_session_record(
             self.target, cols=self.cols, cwd=cwd, history=history, lease=None, source=source,
-            close_on_disconnect=_flag(self.params, "close_on_disconnect"),
+            close_on_disconnect=_flag(self.params, "close_on_disconnect"), model_tool_policy=self.model_tool_policy,
             profile_home=self.profile_home, explicit_cwd=bool(self.profile_resume_cwd), **extra)
 
     def claim(self, sid: str, record: dict) -> dict | None:
@@ -520,8 +642,12 @@ class _Resume:
         return sanitize_replay_history(raw), display, raw
 
     def info(self, cwd: str, overrides: dict) -> dict:
-        return _lazy_resume_info(cwd, model=(overrides.get("model_override") or {}).get("model") or "",
+        info = _lazy_resume_info(cwd, model=(overrides.get("model_override") or {}).get("model") or "",
                                  provider=overrides.get("provider_override") or "", profile=self.profile)
+        if self.model_tool_policy is not None:
+            from agent.model_tool_policy import model_tool_policy_identity
+            info["model_tool_policy"] = model_tool_policy_identity(self.model_tool_policy)
+        return info
 
     def child_history(self, repair: bool) -> list:
         """The child's OWN conversation (no ancestors), row ids included."""
@@ -625,22 +751,45 @@ def _resume_locate(ctx: _Resume) -> dict | None:
     return None if ctx.found else _err(ctx.rid, 4007, "session not found")
 
 
-def _resume_follow_tip(ctx: _Resume) -> None:
+def _resume_follow_tip(ctx: _Resume) -> dict | None:
     """Rebind a rotated-out parent id to its compression tip (resuming the original reloads the parent
     transcript and loses the post-compression reply). Skipped for lazy watch windows (exact child); Bot Chat
     follows proven compression edges only."""
     if not ctx.found or ctx.lazy:
-        return
+        return None
     tip = ctx.target
-    with contextlib.suppress(Exception):
+    try:
         from tools.bot_mode_probe import BOT_CHAT_TITLE
         if (ctx.found.get("title") or "").strip() == BOT_CHAT_TITLE:
             tip = ctx.db.get_compression_tip(ctx.target) or ctx.target
         else:
             tip = ctx.db.resolve_resume_session_id(ctx.target)
+    except Exception as exc:
+        from agent.model_tool_policy import ModelToolPolicyContinuityError
+        if isinstance(exc, ModelToolPolicyContinuityError):
+            return _err(ctx.rid, 4027, f"compression model-tool policy invalid: {exc}")
+        return None
     if tip and tip != ctx.target:
         ctx.target = tip
         ctx.found = ctx.db.get_session(tip) or ctx.found
+    return None
+
+
+def _resume_model_tool_policy(ctx: _Resume) -> dict | None:
+    """Restore and revalidate durable policy; declared corruption is never legacy-open."""
+    from agent.model_tool_policy import decode_stored_model_tool_policy
+    try:
+        policy = decode_stored_model_tool_policy(
+            ctx.found.get("model_tool_policy_version"), ctx.found.get("model_tool_policy"),
+        )
+        if policy is not None:
+            ctx.model_tool_policy = _create_model_tool_policy(
+                {"model_tool_policy": policy},
+                source=str(ctx.found.get("source") or "tui"), profile_home=ctx.profile_home,
+            )
+    except (TypeError, ValueError, RuntimeError) as exc:
+        return _err(ctx.rid, 4027, f"stored model-tool policy invalid: {exc}")
+    return None
 
 
 def _resume_guard(ctx: _Resume) -> dict | None:
@@ -700,6 +849,9 @@ def _resume_response(
                **({"messages_omitted": ctx.omit_messages} if hydrating is None else {"hydrating": hydrating}),
                "info": info, "inflight": None, "running": running, "session_key": ctx.target,
                "started_at": record["created_at"] if started_at is None else started_at, "status": status}
+    if ctx.model_tool_policy is not None:
+        from agent.model_tool_policy import model_tool_policy_identity
+        payload["model_tool_policy"] = model_tool_policy_identity(ctx.model_tool_policy)
     if auto_continue is not None:
         payload["auto_continue"] = auto_continue
     return _ok(ctx.rid, _attach_todo_state(payload, record))
@@ -781,7 +933,7 @@ def _resume_eager(ctx: _Resume) -> dict:
             agent = _make_agent_in_context(
                 sid, ctx.target, session_db=ctx.db, platform_override=source,
                 context_cwd_is_launch_artifact=(source in _LAUNCH_CWD_NOT_A_WORKSPACE and not ctx.profile_resume_cwd),
-                **stored_runtime_overrides)
+                model_tool_policy=ctx.model_tool_policy, **stored_runtime_overrides)
         except Exception as e:
             return _err(ctx.rid, 5000, f"resume failed: {e}")
     with _session_resume_lock:
@@ -793,7 +945,8 @@ def _resume_eager(ctx: _Resume) -> dict:
         try:
             with _profile_build_scope(ctx.profile_home):
                 _init_session(sid, ctx.target, agent, history, cols=ctx.cols, cwd=ctx.profile_resume_cwd,
-                              session_db=ctx.db, source=source, explicit_cwd=bool(ctx.profile_resume_cwd))
+                              session_db=ctx.db, source=source, explicit_cwd=bool(ctx.profile_resume_cwd),
+                              model_tool_policy=ctx.model_tool_policy)
                 # Ownership TRANSFER: the agent holds the handle for life (AIAgent.close() releases it). The
                 # owns_db drop is UNCONDITIONAL — the session is registered against the handle, so the finally
                 # must not close it even if the transfer was refused (a leak beats "closed database" every
@@ -834,7 +987,10 @@ def _(rid, params: dict) -> dict:
             return _db_unavailable_error(rid, code=5000)
         if (resp := _resume_locate(ctx)) is not None:
             return resp
-        _resume_follow_tip(ctx)
+        if (resp := _resume_follow_tip(ctx)) is not None:
+            return resp
+        if (resp := _resume_model_tool_policy(ctx)) is not None:
+            return resp
         if (resp := _resume_guard(ctx)) is not None:
             return resp
         ctx.profile_resume_cwd = _str_param(ctx.found, "cwd") or _profile_configured_cwd(ctx.profile_home)

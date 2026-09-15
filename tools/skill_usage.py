@@ -11,11 +11,13 @@ import json
 import logging
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from hermes_constants import get_hermes_home
 from agent.skill_utils import is_excluded_skill_path, is_external_skill_path
+from tools.skill_mutation_lock import skill_mutation_lock
 from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -291,6 +293,15 @@ def list_unmanaged_skill_names() -> List[str]:
         and is_curation_eligible(name, md))
 
 
+def _classification_transition(operation):
+    """Keep the profile mutation lock outside the subordinate usage-file lock."""
+    @wraps(operation)
+    def locked(*args, **kwargs):
+        with skill_mutation_lock():
+            return operation(*args, **kwargs)
+    return locked
+
+
 def unmanaged_report() -> List[Dict[str, Any]]:
     """Rows for :func:`list_unmanaged_skill_names`; ``has_provenance_key`` (False = pre-dates ``created_by``) explains
     WHY, it is not a signal to adopt on."""
@@ -299,6 +310,7 @@ def unmanaged_report() -> List[Dict[str, Any]]:
             for n in list_unmanaged_skill_names()]
 
 
+@_classification_transition
 def adopt_skill(skill_name: str) -> Tuple[bool, str]:
     """User-declared handover: writes the ``created_by: agent`` marker (inactivity clock NOT reset). Refuses hub,
     external, bundled and protected skills. Returns (ok, message)."""
@@ -486,6 +498,7 @@ def bump_patch(skill_name: str, *, action: str = "patch", task_id: Optional[str]
                      session_id=session_id)
 
 
+@_classification_transition
 def record_created(skill_name: str, *, agent_created: bool, task_id: Optional[str] = None,
                    session_id: Optional[str] = None) -> None:
     """Persist creation provenance and emit a create fact; the record is reset (a create is a new logical skill)."""
@@ -496,6 +509,7 @@ def record_created(skill_name: str, *, agent_created: bool, task_id: Optional[st
     _mutate_and_emit(skill_name, "created", _apply, task_id=task_id, session_id=session_id)
 
 
+@_classification_transition
 def record_installed(skill_name: str) -> None:
     """Record a successful Skills Hub install without exporting its name."""
     def _apply(rec: Dict[str, Any]) -> Dict[str, Any]:
@@ -504,11 +518,13 @@ def record_installed(skill_name: str) -> None:
     _mutate_and_emit(skill_name, "installed", _apply)
 
 
+@_classification_transition
 def mark_agent_created(skill_name: str) -> None:
     """Opt a skill into curator management — the only thing that makes it eligible for automatic curation."""
     _set_field(skill_name, "created_by", "agent")
 
 
+@_classification_transition
 def set_state(skill_name: str, state: str) -> None:
     """Set lifecycle state (no-op if invalid / unmanageable). Emits archived/stale/restored; active<-stale is silent."""
     if state not in _VALID_STATES:
@@ -530,6 +546,7 @@ def set_state(skill_name: str, state: str) -> None:
             _emit_skill_lifecycle(skill_name, action, record=facts)
 
 
+@_classification_transition
 def set_pinned(skill_name: str, pinned: bool) -> bool:
     """False when the write did not land (not curation-eligible).
 
@@ -580,6 +597,7 @@ def _relocate(src: Path, dest: Path, skill_name: str, action: str, **capture_kwa
     return True, f"{action}d to {dest}"
 
 
+@_classification_transition
 def archive_skill(skill_name: str) -> Tuple[bool, str]:
     """Move a curator-eligible skill dir to ``.archive/`` (flattened; timestamp suffix on collision). Never hub;
     bundled built-ins only with ``curator.prune_builtins`` (and then suppressed from re-seeding)."""
@@ -608,6 +626,7 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
     return _relocate(skill_dir, dest, skill_name, "archive", complete_package=True, skill=skill_name)
 
 
+@_classification_transition
 def restore_skill(skill_name: str) -> Tuple[bool, str]:
     """Move an archived skill back to the flat layout (nesting NOT reconstructed). Refuses a name now colliding with
     a hub skill, or a bundled built-in unless ``curator.prune_builtins`` is on (restoring lifts a prune)."""

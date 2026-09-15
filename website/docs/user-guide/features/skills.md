@@ -612,6 +612,29 @@ than 60 reference files). They warn; they never block a write.
 The `patch` action is preferred for updates — it's more token-efficient than `edit` because only the changed text appears in the tool call.
 :::
 
+### Exact raw identity and approved guarded patches
+
+`skill_view` can opt into `raw_identity: true` for one allowed `SKILL.md` or
+supporting file. Add `raw_text: true` to return the same strict UTF-8 bytes as text;
+the reported byte length and SHA-256 are computed before rendering, preprocessing, or
+newline normalization. Invalid UTF-8, traversal, symlinks, and requests for more than
+one raw file fail closed. Plugin and protected skills may expose raw identity only when
+the normal skill owner already permits that file to be read.
+
+An intrinsically approved plugin handler may dispatch one guarded `skill_manage`
+`patch` operation. The operation is closed to one existing curator-managed local file
+and binds the exact current SHA-256, expected-result SHA-256, profile-relative skill
+root, approval scope, and `sync_policy: suppress`. Hermes serializes supported skill
+writers with the profile mutation lock, applies one literal replacement, verifies the
+exact resulting bytes, and restores the original target bytes and mode if write,
+security-scan, or readback verification fails. Exact expected-result bytes return
+`already_applied` without another write or patch-generation increment. Guarded calls
+never schedule remote skill sync; ordinary `skill_manage` behavior is unchanged.
+
+This V1 contract covers supported Hermes writers. It does not claim protection from
+local processes that bypass Hermes' lock, hostile filesystem replacement, package-wide
+transactions, or crash-proof multi-file recovery.
+
 ### Gating agent skill writes (`skills.write_approval`)
 
 By default the agent writes skills freely — including from the [background

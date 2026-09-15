@@ -32,6 +32,7 @@ from tools.skill_manager_guards import (
     _containing_skills_root, _curator_consolidation_delete_guard, _maybe_auto_propose_org_edit,
     _org_mirror_write_guard, _pinned_guard, _validate_delete_target, _is_background_review, _refusal as _err)
 from tools.skill_manager_batch import _skill_manage_batch
+from tools.skill_mutation_lock import skill_mutation_lock
 from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
 
 logger = logging.getLogger(__name__)
@@ -732,7 +733,7 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
         _maybe_debounced_sync_push(name)
 
 
-def skill_manage(
+def _skill_manage_unlocked(
     action: str, name: str, content: str = None, category: str = None, file_path: str = None,
     file_content: str = None, old_string: str = None, new_string: str = None,
     replace_all: bool = False, absorbed_into: str = None, task_id: str = None,
@@ -740,6 +741,41 @@ def skill_manage(
     """Dispatch to the action handler -> JSON string. ``operations`` (atomic batch shape,
     see _skill_manage_batch) overrides the flat fields."""
     if operations is not None:
+        from tools.skill_guarded_patch import (
+            GuardedPatchValidationError,
+            execute_guarded_patch,
+            guarded_patch_failure,
+            has_guarded_patch_intent,
+            validate_guarded_patch_operation,
+        )
+
+        if has_guarded_patch_intent(operations):
+            if not isinstance(operations, list) or len(operations) != 1:
+                return json.dumps(guarded_patch_failure(
+                    "validation_failed", "Guarded patch requires exactly one operation."
+                ))
+            try:
+                guarded_operation = validate_guarded_patch_operation(operations[0])
+            except GuardedPatchValidationError:
+                return json.dumps(guarded_patch_failure(
+                    "validation_failed", "Guarded patch operation is invalid."
+                ))
+            if not _skill_gate_bypass.get():
+                def _staging(wa):
+                    return (
+                        {"action": "batch", "operations": operations},
+                        f"batch(1 ops: patch) on {guarded_operation.name}",
+                    )
+
+                staged = _run_write_gate(_staging)
+                if staged is not None:
+                    return staged
+            return json.dumps(
+                execute_guarded_patch(
+                    guarded_operation, task_id=task_id, session_id=session_id
+                ),
+                ensure_ascii=False,
+            )
         return _skill_manage_batch(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)
     if (preflight := _background_review_preflight(action, name)) is not None:
@@ -775,6 +811,20 @@ def skill_manage(
             action, name, result, file_path=file_path, absorbed_into=absorbed_into,
             task_id=task_id, session_id=session_id, ledger_before=_ledger_before)
     return json.dumps(result, ensure_ascii=False)
+
+
+def skill_manage(
+    action: str, name: str, content: str = None, category: str = None, file_path: str = None,
+    file_content: str = None, old_string: str = None, new_string: str = None,
+    replace_all: bool = False, absorbed_into: str = None, task_id: str = None,
+    session_id: str = None, operations=None) -> str:
+    """Run the complete skill writer transaction under the active profile's lock."""
+    with skill_mutation_lock():
+        return _skill_manage_unlocked(
+            action=action, name=name, content=content, category=category, file_path=file_path,
+            file_content=file_content, old_string=old_string, new_string=new_string,
+            replace_all=replace_all, absorbed_into=absorbed_into, task_id=task_id,
+            session_id=session_id, operations=operations)
 
 
 # --- OpenAI Function-Calling Schema -------------------------------------------

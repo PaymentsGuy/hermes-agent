@@ -1,6 +1,7 @@
 """Focused tests for API server session-control endpoints."""
 
 import asyncio
+import json
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,6 +12,17 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_state import SessionDB
+from agent.model_tool_policy import MODEL_TOOL_POLICY_VERSION
+
+
+POLICY_SHA = "e" * 64
+
+
+def _model_tool_policy(*allowed):
+    return {
+        "policy_id": "api-fork-policy", "policy_sha256": POLICY_SHA,
+        "allowed_tools": list(allowed), "approval_required_tools": [],
+    }
 
 
 @pytest.fixture
@@ -53,6 +65,35 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
+@pytest.mark.parametrize("unsupported", ["delegate_task", "execute_code"])
+@pytest.mark.asyncio
+async def test_api_create_rejects_nested_execution_policy_before_persistence(
+    adapter, session_db, monkeypatch, unsupported,
+):
+    monkeypatch.setattr(
+        "model_tools.get_tool_definitions",
+        lambda **_kwargs: [
+            {"type": "function", "function": {"name": name}}
+            for name in ("read_file", "delegate_task", "execute_code")
+        ],
+    )
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/api/sessions",
+            json={
+                "id": f"unsupported-{unsupported}",
+                "model_tool_policy": _model_tool_policy("read_file", unsupported),
+            },
+        )
+        payload = await response.json()
+
+    assert response.status == 400
+    assert payload["error"]["code"] == "invalid_model_tool_policy"
+    assert "unsupported V1 nested execution authority" in payload["error"]["message"]
+    assert session_db.get_session(f"unsupported-{unsupported}") is None
+
+
 @pytest.mark.asyncio
 async def test_capabilities_advertises_session_control_surface(adapter):
     app = _create_session_app(adapter)
@@ -80,6 +121,50 @@ async def test_capabilities_advertises_session_control_surface(adapter):
         "method": "POST",
         "path": "/v1/runs/{run_id}/steer",
     }
+
+
+@pytest.mark.asyncio
+async def test_api_fork_inherits_exact_parent_model_tool_policy(adapter, session_db, monkeypatch):
+    policy = _model_tool_policy("read_file")
+    session_db.create_session(
+        "policy-parent", "api_server", model_tool_policy=policy,
+        model_tool_policy_version=MODEL_TOOL_POLICY_VERSION,
+    )
+    session_db.append_message("policy-parent", "user", "hello")
+    monkeypatch.setattr(adapter, "_validate_api_model_tool_policy", lambda value: value)
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post("/api/sessions/policy-parent/fork", json={"id": "policy-child"})
+        payload = await response.json()
+
+    assert response.status == 201, payload
+    child = session_db.get_session("policy-child")
+    assert child["model_tool_policy_version"] == MODEL_TOOL_POLICY_VERSION
+    assert json.loads(child["model_tool_policy"]) == policy
+    assert payload["session"]["model_tool_policy"] == {
+        "policy_id": policy["policy_id"], "policy_sha256": policy["policy_sha256"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_api_fork_rejects_corrupt_declared_parent_policy(adapter, session_db):
+    session_db.create_session("corrupt-policy-parent", "api_server")
+    session_db._execute_write(lambda conn: conn.execute(
+        "UPDATE sessions SET model_tool_policy_version = ? WHERE id = ?",
+        (MODEL_TOOL_POLICY_VERSION, "corrupt-policy-parent"),
+    ))
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/api/sessions/corrupt-policy-parent/fork", json={"id": "must-not-exist"},
+        )
+        payload = await response.json()
+
+    assert response.status == 409
+    assert payload["error"]["code"] == "invalid_model_tool_policy"
+    assert session_db.get_session("must-not-exist") is None
 
 
 @pytest.mark.asyncio

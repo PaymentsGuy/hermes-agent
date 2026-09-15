@@ -1,5 +1,6 @@
 """Regression tests for profile-scoped skills_tool path resolution."""
 
+import hashlib
 import importlib
 import json
 from pathlib import Path
@@ -52,6 +53,34 @@ def test_skill_view_uses_live_profile_home_after_module_import(tmp_path, monkeyp
     assert result["name"] == "kanban-orchestrator-operations"
     assert Path(result["skill_dir"]) == profile_skill_dir
     assert "orchestrator profile" in result["content"]
+
+
+def test_raw_skill_identity_uses_live_profile_home_after_module_import(tmp_path, monkeypatch):
+    default_home = tmp_path / "default-home"
+    profile_home = tmp_path / "profiles" / "orchestrator"
+    default_skill_dir = _write_skill(
+        default_home, "software-development", "same-skill", "default home"
+    )
+    profile_skill_dir = _write_skill(
+        profile_home, "software-development", "same-skill", "orchestrator profile"
+    )
+    default_bytes = (default_skill_dir / "SKILL.md").read_bytes()
+    profile_bytes = (profile_skill_dir / "SKILL.md").read_bytes()
+    assert default_bytes != profile_bytes
+
+    skills_tool = _reload_skills_tool(default_home, monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    result = json.loads(
+        skills_tool.skill_view(
+            "same-skill", preprocess=False, raw_identity=True, raw_text=True
+        )
+    )
+
+    assert result["success"] is True
+    assert result["raw_text"].encode("utf-8") == profile_bytes
+    assert result["raw_files"][0]["sha256"] == hashlib.sha256(profile_bytes).hexdigest()
+    assert result["raw_files"][0]["sha256"] != hashlib.sha256(default_bytes).hexdigest()
 
 
 def test_explicit_skills_dir_monkeypatch_still_wins(tmp_path, monkeypatch):

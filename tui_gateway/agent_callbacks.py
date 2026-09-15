@@ -272,38 +272,63 @@ def _load_fallback_model():
     return get_fallback_chain(_load_cfg())
 
 
-def _background_agent_kwargs(agent, task_id: str) -> dict:
-    cfg = _load_cfg()
+def _background_agent_kwargs(agent, task_id: str, *, profile_home: str | None = None) -> dict:
+    home_token = set_hermes_home_override(profile_home) if profile_home else None
+    try:
+        cfg = _load_cfg()
 
-    def g(name, default=None):
-        return getattr(agent, name, default)
+        def g(name, default=None):
+            return getattr(agent, name, default)
 
-    # Don't rehydrate a deliberately empty fallback chain.
-    if hasattr(agent, "_fallback_chain"):
-        fallback = agent._fallback_chain or []
-    else:
-        fallback = (agent._fallback_model if hasattr(agent, "_fallback_model")
-                    else _load_fallback_model())
-    # Detached tasks declare platform="tui" (no UI sid for renderer-routed events), so resolve
-    # toolsets against it — never GUI schema they can't use.
-    return {
-        **{k: g(k) or None for k in ("base_url", "api_key", "provider", "api_mode", "acp_command",
-                                     "acp_args", "ephemeral_system_prompt")},
-        **{k: g(k) for k in ("providers_allowed", "providers_ignored", "providers_order", "provider_sort",
-                             "provider_data_collection", "openrouter_min_coding_score")},
-        "model": g("model") or _resolve_model(), "max_iterations": _cfg_max_turns(cfg, 25),
-        "enabled_toolsets": g("enabled_toolsets") or _load_enabled_toolsets("tui"),
-        "quiet_mode": True, "verbose_logging": False,
-        "provider_require_parameters": g("provider_require_parameters", False), "session_id": task_id,
-        "reasoning_config": g("reasoning_config") or _load_reasoning_config(str(g("model", "") or "")),
-        "service_tier": g("service_tier") or _load_service_tier(),
-        "request_overrides": dict(g("request_overrides", {}) or {}),
-        "platform": "tui", "session_db": _get_db(), "fallback_model": fallback}
+        # Don't rehydrate a deliberately empty fallback chain.
+        if hasattr(agent, "_fallback_chain"):
+            fallback = agent._fallback_chain or []
+        else:
+            fallback = (agent._fallback_model if hasattr(agent, "_fallback_model")
+                        else _load_fallback_model())
+        # Detached tasks declare platform="tui" (no UI sid for renderer-routed events), so resolve
+        # toolsets against it — never GUI schema they can't use.
+        enabled_toolsets = g("enabled_toolsets") or _load_enabled_toolsets("tui")
+        from agent.model_tool_policy import validate_inherited_model_tool_policy
+        policy = validate_inherited_model_tool_policy(
+            agent, enabled_toolsets=enabled_toolsets,
+        )
+        return {
+            **{k: g(k) or None for k in ("base_url", "api_key", "provider", "api_mode", "acp_command",
+                                         "acp_args", "ephemeral_system_prompt")},
+            **{k: g(k) for k in ("providers_allowed", "providers_ignored", "providers_order", "provider_sort",
+                                 "provider_data_collection", "openrouter_min_coding_score")},
+            "model": g("model") or _resolve_model(), "max_iterations": _cfg_max_turns(cfg, 25),
+            "enabled_toolsets": enabled_toolsets,
+            "quiet_mode": True, "verbose_logging": False,
+            "provider_require_parameters": g("provider_require_parameters", False), "session_id": task_id,
+            "reasoning_config": g("reasoning_config") or _load_reasoning_config(str(g("model", "") or "")),
+            "service_tier": g("service_tier") or _load_service_tier(),
+            "request_overrides": dict(g("request_overrides", {}) or {}),
+            "platform": "tui", "session_db": _get_db(), "fallback_model": fallback,
+            "model_tool_policy": policy}
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
 
 
-def _ephemeral_preview_agent_kwargs(agent, task_id: str) -> dict:
-    return {**_background_agent_kwargs(agent, task_id),
-            "enabled_toolsets": ["terminal", "file"], "session_db": None, "skip_memory": True}
+def _ephemeral_preview_agent_kwargs(
+    agent, task_id: str, *, profile_home: str | None = None,
+) -> dict:
+    home_token = set_hermes_home_override(profile_home) if profile_home else None
+    try:
+        kwargs = _background_agent_kwargs(agent, task_id)
+        from agent.model_tool_policy import validate_inherited_model_tool_policy
+        kwargs.update(
+            enabled_toolsets=["terminal", "file"], session_db=None, skip_memory=True,
+            model_tool_policy=validate_inherited_model_tool_policy(
+                agent, enabled_toolsets=["terminal", "file"],
+            ),
+        )
+        return kwargs
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
 
 
 def _preview_restart_history(session: dict, max_messages: int = 24, max_tool_chars: int = 1200) -> list[dict]:
@@ -385,6 +410,11 @@ def _rebuild_session_agent(sid: str, session: dict, **kwargs):
     An unscoped _make_agent defaults to the launch store: named-profile Bot Chat turns then disappear
     from the profile's replay even though they were successfully written to another database (#104079).
     """
+    from agent.model_tool_policy import decode_model_tool_policy_carrier
+
+    policy = decode_model_tool_policy_carrier(
+        session.get("model_tool_policy_version"), session.get("model_tool_policy"))
+    kwargs["model_tool_policy"] = policy
     old_agent = session.get("agent")
     profile_home = session.get("profile_home")
     session_db = getattr(old_agent, "_session_db", None)

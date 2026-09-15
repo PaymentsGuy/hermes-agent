@@ -270,6 +270,7 @@ class AIAgent(
         checkpoint_max_total_size_mb: int = 500, checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False, requested_provider: str = None,
         capabilities: Dict[str, bool] | None = None,
+        model_tool_policy: Dict[str, Any] | None = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent`` (same keyword parameters, minus ``tool_delay``)."""
         init_kwargs = {k: v for k, v in locals().items() if k not in ("self", "tool_delay")}
@@ -343,6 +344,8 @@ class AIAgent(
                 display_name=getattr(self, "_chat_name", None) or getattr(self, "_user_name", None),
                 origin_json=_gateway_origin_json(self), parent_session_id=self._parent_session_id,
                 cwd=_launch_cwd_for_session(source), profile_name=profile_for_session,
+                model_tool_policy=self.model_tool_policy,
+                model_tool_policy_version=(1 if self.model_tool_policy is not None else None),
             )
             self._session_db_created = True
         except Exception as e:
@@ -745,7 +748,7 @@ class AIAgent(
         instead of hitting the user's GPU mid-session; everything else spawns immediately. ``explicit``
         (/refine) is never deferred but does not touch the ``focus``-keyed delegate/enabled gates.
         """
-        # Gates run at enqueue/spawn time; the idle dispatcher re-checks `enabled` at dispatch time.
+        # Gates run at enqueue/spawn time; idle dispatch reloads and preflights the complete current block.
         if focus is None and getattr(self, "_delegate_depth", 0) > 0:
             return
         task_cfg = None

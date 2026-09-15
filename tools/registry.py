@@ -7,13 +7,18 @@ model_tools."""
 
 import ast
 import functools
+import hashlib
 import importlib
+import inspect
 import json
 import logging
 import sys
 import threading
 import time
-from dataclasses import dataclass
+import weakref
+from collections.abc import Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
@@ -26,6 +31,107 @@ _MAX_TOOL_ERROR_CHARS = 2048
 _TOOL_ERROR_TRUNCATION_MARKER = "… [truncated]"
 # Logs keep more of the body than the model sees, but still a bounded amount.
 _MAX_LOGGED_ERROR_CHARS = 8192
+
+APPROVAL_PREVIEW_MAX_BYTES = 24 * 1024
+_APPROVAL_CONTEXT_ID_MAX_BYTES = 1024
+
+
+class ApprovalPreviewError(ValueError):
+    """An intrinsic approval preview could not be resolved safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalPreviewContext:
+    """Bounded identity passed to a read-only plugin preview resolver."""
+
+    tool_name: str
+    session_id: str
+    profile_name: str
+    tool_call_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolApprovalMetadata:
+    human_approval: Optional[str] = None
+    approval_preview: Optional[Callable] = None
+
+
+def _canonical_json_mapping(
+    value, *, label: str, max_bytes: Optional[int] = None,
+) -> tuple[dict, bytes]:
+    if not isinstance(value, Mapping):
+        raise ApprovalPreviewError(f"{label} must be a JSON-serializable mapping")
+    try:
+        encoded = json.dumps(
+            dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except Exception:
+        raise ApprovalPreviewError(
+            f"{label} must be finite and JSON-serializable"
+        ) from None
+    if max_bytes is not None and len(encoded) > max_bytes:
+        raise ApprovalPreviewError(f"{label} exceeds the 24 KiB UTF-8 JSON limit")
+    # Round-tripping closes over plain JSON containers and gives the resolver/result
+    # consumer a detached copy rather than a plugin- or caller-owned mapping.
+    try:
+        return json.loads(encoded), encoded
+    except Exception:
+        raise ApprovalPreviewError(
+            f"{label} must be finite and JSON-serializable"
+        ) from None
+
+
+def canonical_approval_preview_bytes(preview: Mapping) -> bytes:
+    """Return closed, canonical UTF-8 JSON bytes for a bounded preview mapping."""
+    return _canonical_json_mapping(
+        preview, label="approval_preview result", max_bytes=APPROVAL_PREVIEW_MAX_BYTES,
+    )[1]
+
+
+def approval_preview_hash(preview: Mapping) -> str:
+    """SHA-256 of the canonical approval preview bytes."""
+    return hashlib.sha256(canonical_approval_preview_bytes(preview)).hexdigest()
+
+
+def _bounded_approval_identity(value, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ApprovalPreviewError(f"{field_name} must be a string")
+    if len(value.encode("utf-8")) > _APPROVAL_CONTEXT_ID_MAX_BYTES:
+        raise ApprovalPreviewError(f"{field_name} exceeds the bounded identity limit")
+    return value
+
+
+def _approval_metadata(
+    human_approval, approval_preview, *, plugin_authorized: bool,
+) -> _ToolApprovalMetadata:
+    if human_approval is not None and (
+        not isinstance(human_approval, str) or human_approval != "always"
+    ):
+        raise ValueError("human_approval must be None or the exact string 'always'")
+    if human_approval is None:
+        if approval_preview is not None:
+            raise ValueError(
+                "approval_preview must be absent when human_approval is None"
+            )
+        return _ToolApprovalMetadata()
+    if not plugin_authorized:
+        raise PermissionError(
+            "human_approval metadata is available only to plugin-provided tools"
+        )
+    if not callable(approval_preview):
+        raise TypeError(
+            "approval_preview must be callable when human_approval='always'"
+        )
+    call_method = getattr(approval_preview, "__call__", None)
+    if (
+        inspect.iscoroutinefunction(approval_preview)
+        or inspect.iscoroutinefunction(call_method)
+        or inspect.isasyncgenfunction(approval_preview)
+        or inspect.isasyncgenfunction(call_method)
+    ):
+        raise TypeError("approval_preview must be synchronous in V1")
+    return _ToolApprovalMetadata("always", approval_preview)
 
 
 def _bound_error_text(text: str) -> str:
@@ -178,6 +284,25 @@ class ToolEntry:
     # Zero-arg callable whose dict is shallow-merged onto the schema at every get_definitions()
     # — for fields tracking runtime config (delegate_task's description reflects limits).
     dynamic_schema_overrides: Optional[Callable] = None
+    _approval: _ToolApprovalMetadata = field(default_factory=_ToolApprovalMetadata, repr=False)
+
+    def __setattr__(self, name: str, value) -> None:
+        if name == "_approval":
+            try:
+                object.__getattribute__(self, "_approval")
+            except AttributeError:
+                pass
+            else:
+                raise AttributeError("tool approval metadata is immutable")
+        object.__setattr__(self, name, value)
+
+    @property
+    def human_approval(self) -> Optional[str]:
+        return self._approval.human_approval
+
+    @property
+    def approval_preview(self) -> Optional[Callable]:
+        return self._approval.approval_preview
 
 
 class _PluginOverridePolicy:
@@ -187,6 +312,25 @@ class _PluginOverridePolicy:
 
     def __init__(self, allowed: bool) -> None:
         self.allowed = bool(allowed)
+
+
+@dataclass(frozen=True, slots=True)
+class _PluginContextProvenance:
+    """Registry-owned identity binding for one host-created plugin context generation."""
+
+    context_ref: weakref.ReferenceType
+    manager_ref: weakref.ReferenceType
+    manager_generation: object
+    plugin_key: str
+    scope: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PluginToolRegistrationProvenance:
+    """One-shot authority for one exact plugin-context tool registration."""
+
+    context: _PluginContextProvenance
+    tool_name: str
 
 
 _OVERRIDE_DENIED_MSG = (
@@ -377,10 +521,16 @@ class ToolRegistry:
         # remain confined to the profile that loaded them.
         self._plugin_override_policy: Dict[tuple[Optional[str], str], _PluginOverridePolicy] = {}
         self._plugin_module_scopes: Dict[str, Set[Optional[str]]] = {}
+        self._plugin_contexts: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        self._plugin_tool_registration_capabilities: Dict[
+            object, _PluginToolRegistrationProvenance
+        ] = {}
         self._toolset_checks: Dict[str, Callable] = {}
         self._toolset_aliases: Dict[str, str] = {}
         # MCP refresh mutates while other threads read: serialize writes, snapshot reads.
         self._lock = threading.RLock()
+        self._intrinsic_handler_counts: Dict[Optional[str], int] = {}
+        self._intrinsic_handler_lock = threading.Lock()
         # Bumped on every mutation; get_tool_definitions memoizes against it.
         self._generation: int = 0
 
@@ -593,15 +743,179 @@ class ToolRegistry:
         except Exception:
             return ""
 
-    def register(
-        self, name: str, toolset: str, schema: dict, handler: Callable,
-        check_fn: Callable = None, requires_env: list = None, is_async: bool = False,
+    def _bind_plugin_context(
+        self, context, manager, *, manager_generation: object, plugin_key: str, scope: str,
+    ) -> None:
+        """Bind a host-owned PluginContext to one manager/plugin/scope generation by identity."""
+        if scope is None or getattr(context, "_manager", None) is not manager:
+            raise PermissionError("invalid plugin registration provenance")
+        with self._lock:
+            self._plugin_contexts[context] = _PluginContextProvenance(
+                context_ref=weakref.ref(context), manager_ref=weakref.ref(manager),
+                manager_generation=manager_generation, plugin_key=plugin_key, scope=scope,
+            )
+
+    def _purge_plugin_context_generation(
+        self, *, manager, manager_generation: object, plugin_key: str,
+    ) -> None:
+        """Revoke all pending registrations and context bindings for one plugin generation."""
+        with self._lock:
+            def matches(provenance: _PluginContextProvenance) -> bool:
+                return bool(
+                    provenance.manager_ref() is manager
+                    and provenance.manager_generation is manager_generation
+                    and provenance.plugin_key == plugin_key
+                )
+
+            stale_capabilities = [
+                capability for capability, issued
+                in self._plugin_tool_registration_capabilities.items()
+                if matches(issued.context)
+            ]
+            for capability in stale_capabilities:
+                self._plugin_tool_registration_capabilities.pop(capability, None)
+            stale_contexts = [
+                context for context, provenance in self._plugin_contexts.items()
+                if matches(provenance)
+            ]
+            for context in stale_contexts:
+                self._plugin_contexts.pop(context, None)
+
+    @staticmethod
+    def _plugin_context_is_active(
+        provenance: _PluginContextProvenance, *, context, manager, manager_generation: object,
+        plugin_key: str, scope: Optional[str],
+    ) -> bool:
+        return bool(
+            scope is not None
+            and provenance.context_ref() is context
+            and provenance.manager_ref() is manager
+            and provenance.manager_generation is manager_generation
+            and provenance.plugin_key == plugin_key
+            and provenance.scope == scope
+            and getattr(context, "_manager", None) is manager
+            and getattr(context, "plugin_id", None) == plugin_key
+            and getattr(manager, "scope_key", None) == scope
+            and manager._plugin_context_generation_is_active(plugin_key, manager_generation)
+        )
+
+    def _issue_plugin_tool_registration(
+        self, *, context, manager, manager_generation: object, plugin_key: str,
+        scope: Optional[str], name: str,
+    ) -> object:
+        """Mint one opaque, exact-registration capability for a bound PluginContext."""
+        with self._lock:
+            provenance = self._plugin_contexts.get(context)
+            if provenance is None or not self._plugin_context_is_active(
+                provenance, context=context, manager=manager,
+                manager_generation=manager_generation, plugin_key=plugin_key, scope=scope,
+            ):
+                raise PermissionError("invalid plugin registration provenance")
+            capability = object()
+            self._plugin_tool_registration_capabilities[capability] = (
+                _PluginToolRegistrationProvenance(provenance, name)
+            )
+            return capability
+
+    def _plugin_context_active_in_scope(self, context, scope: str) -> bool:
+        """Return whether one host-bound plugin context is live in the active exact scope."""
+        with self._lock:
+            provenance = self._plugin_contexts.get(context)
+            if provenance is None or self.current_scope_key() != scope:
+                return False
+            manager = provenance.manager_ref()
+            return bool(
+                manager is not None
+                and self._plugin_context_is_active(
+                    provenance,
+                    context=context,
+                    manager=manager,
+                    manager_generation=provenance.manager_generation,
+                    plugin_key=provenance.plugin_key,
+                    scope=scope,
+                )
+            )
+
+    def _register_plugin_tool(
+        self, capability, *, context, manager, manager_generation: object, plugin_key: str,
+        name: str, toolset: str, schema: dict, handler: Callable,
+        check_fn: Optional[Callable] = None, requires_env: Optional[list] = None, is_async: bool = False,
         description: str = "", emoji: str = "", max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None, override: bool = False,
-        scope: Optional[str] = None):
+        scope: Optional[str] = None, human_approval=None, approval_preview=None,
+    ) -> Optional[ToolEntry]:
+        """Atomically register approval metadata for one exact scoped plugin registration."""
+        with self._lock:
+            issued = self._plugin_tool_registration_capabilities.get(capability)
+            try:
+                provenance = issued.context if issued is not None else None
+                if (
+                    issued is None or issued.tool_name != name or provenance is None
+                    or self._plugin_contexts.get(context) is not provenance
+                    or not self._plugin_context_is_active(
+                        provenance, context=context, manager=manager,
+                        manager_generation=manager_generation, plugin_key=plugin_key, scope=scope,
+                    )
+                ):
+                    raise PermissionError("invalid plugin registration provenance")
+                approval = _approval_metadata(
+                    human_approval, approval_preview, plugin_authorized=True,
+                )
+                return self._register(
+                    name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
+                    requires_env=requires_env, is_async=is_async, description=description, emoji=emoji,
+                    max_result_size_chars=max_result_size_chars,
+                    dynamic_schema_overrides=dynamic_schema_overrides, override=override,
+                    scope=scope, approval=approval, plugin_capability=capability,
+                    plugin_context=context, plugin_manager=manager,
+                    plugin_manager_generation=manager_generation, plugin_key=plugin_key,
+                )
+            finally:
+                self._plugin_tool_registration_capabilities.pop(capability, None)
+
+    def register(
+        self, name: str, toolset: str, schema: dict, handler: Callable,
+        check_fn: Optional[Callable] = None, requires_env: Optional[list] = None, is_async: bool = False,
+        description: str = "", emoji: str = "", max_result_size_chars: int | float | None = None,
+        dynamic_schema_overrides: Callable = None, override: bool = False,
+        scope: Optional[str] = None, *, human_approval=None, approval_preview=None):
         """Register a tool (called at import time by each tool file). ``override=True`` is an
         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
         browser backend); without it, cross-toolset shadowing is rejected."""
+        approval = _approval_metadata(
+            human_approval, approval_preview, plugin_authorized=False,
+        )
+        return self._register(
+            name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
+            requires_env=requires_env, is_async=is_async, description=description, emoji=emoji,
+            max_result_size_chars=max_result_size_chars,
+            dynamic_schema_overrides=dynamic_schema_overrides, override=override,
+            scope=scope, approval=approval,
+        )
+
+    def _register(
+        self, name: str, toolset: str, schema: dict, handler: Callable,
+        check_fn: Optional[Callable] = None, requires_env: Optional[list] = None, is_async: bool = False,
+        description: str = "", emoji: str = "", max_result_size_chars: int | float | None = None,
+        dynamic_schema_overrides: Callable = None, override: bool = False,
+        scope: Optional[str] = None, *, approval: _ToolApprovalMetadata,
+        plugin_capability=None, plugin_context=None, plugin_manager=None,
+        plugin_manager_generation=None, plugin_key: Optional[str] = None,
+    ) -> Optional[ToolEntry]:
+        if approval.human_approval is not None:
+            with self._lock:
+                issued = self._plugin_tool_registration_capabilities.get(plugin_capability)
+                provenance = issued.context if issued is not None else None
+                if (
+                    issued is None or issued.tool_name != name or provenance is None
+                    or self._plugin_contexts.get(plugin_context) is not provenance
+                    or not self._plugin_context_is_active(
+                        provenance, context=plugin_context, manager=plugin_manager,
+                        manager_generation=plugin_manager_generation,
+                        plugin_key=plugin_key, scope=scope,
+                    )
+                ):
+                    raise PermissionError("invalid plugin registration provenance")
         handler_owner = self._plugin_owner_of(handler)
         caller_owner = self._plugin_namespace_of_module(self._caller_module())
         owner = caller_owner or handler_owner
@@ -646,12 +960,23 @@ class ToolRegistry:
                         "replacement is intentional, or deregister the existing tool first.",
                         name, toolset, existing.toolset)
                     return
-            target[name] = ToolEntry(
+            if (
+                existing is not None
+                and existing.human_approval == "always"
+                and approval.human_approval is None
+            ):
+                raise ValueError(
+                    f"Tool {name!r} cannot downgrade human_approval='always' "
+                    "during re-registration"
+                )
+            registered = ToolEntry(
                 name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
                 requires_env=requires_env or [], is_async=is_async,
                 description=description or schema.get("description", ""), emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
-                dynamic_schema_overrides=dynamic_schema_overrides)
+                dynamic_schema_overrides=dynamic_schema_overrides,
+                _approval=approval)
+            target[name] = registered
             # Availability is derived per-tool (_toolset_has_exposable_tools), so this map no
             # longer gates a toolset; it still feeds get_toolset_requirements ->
             # TOOLSET_REQUIREMENTS["check_fn"], which banner.py reads (presence only,
@@ -659,6 +984,7 @@ class ToolRegistry:
             if scope is None and check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
+            return registered
 
     def deregister(self, name: str, *, scope: Optional[str] = None) -> None:
         """Remove a tool; drops the toolset check/aliases if it was the last in its toolset.
@@ -787,7 +1113,79 @@ class ToolRegistry:
             result.append({"type": "function", "function": schema_with_name})
         return result
 
+    # ---- Approval preview -------------------------------------------
+
+    def resolve_approval_preview(
+        self,
+        name: str,
+        args: Mapping,
+        *,
+        session_id: str = "",
+        profile_name: str = "",
+        tool_call_id: str = "",
+        scope: Optional[str] = None,
+    ) -> dict:
+        """Invoke only an intrinsic plugin preview resolver, never its handler or hooks.
+
+        The resolver receives a detached canonical-JSON copy of the original arguments and
+        bounded immutable identity context. Its result is closed over plain JSON containers
+        and capped at 24 KiB of canonical UTF-8 JSON.
+        """
+        entry = self.get_entry(name, scope=scope)
+        if entry is None:
+            raise ApprovalPreviewError(f"Unknown tool: {name}")
+        resolver = entry.approval_preview
+        if entry.human_approval != "always" or resolver is None:
+            raise ApprovalPreviewError(
+                f"Tool {name!r} does not require intrinsic human approval"
+            )
+        canonical_args, _ = _canonical_json_mapping(
+            args, label="approval_preview arguments"
+        )
+        preview_context = ApprovalPreviewContext(
+            tool_name=_bounded_approval_identity(name, "tool_name"),
+            session_id=_bounded_approval_identity(session_id, "session_id"),
+            profile_name=_bounded_approval_identity(profile_name, "profile_name"),
+            tool_call_id=_bounded_approval_identity(tool_call_id, "tool_call_id"),
+        )
+        try:
+            result = resolver(canonical_args, preview_context)
+        except Exception as exc:
+            raise ApprovalPreviewError(
+                f"approval_preview resolver failed: {type(exc).__name__}"
+            ) from exc
+        if inspect.isawaitable(result):
+            close = getattr(result, "close", None)
+            if callable(close):
+                close()
+            raise ApprovalPreviewError("approval_preview resolver must return synchronously")
+        return _canonical_json_mapping(
+            result,
+            label="approval_preview result",
+            max_bytes=APPROVAL_PREVIEW_MAX_BYTES,
+        )[0]
+
     # ---- Dispatch ----------------------------------------------------
+
+    @contextmanager
+    def _intrinsic_handler_scope(self, scope: Optional[str]):
+        with self._intrinsic_handler_lock:
+            self._intrinsic_handler_counts[scope] = (
+                self._intrinsic_handler_counts.get(scope, 0) + 1
+            )
+        try:
+            yield
+        finally:
+            with self._intrinsic_handler_lock:
+                count = self._intrinsic_handler_counts[scope]
+                if count == 1:
+                    self._intrinsic_handler_counts.pop(scope)
+                else:
+                    self._intrinsic_handler_counts[scope] = count - 1
+
+    def _intrinsic_handler_active_in_scope(self, scope: Optional[str]) -> bool:
+        with self._intrinsic_handler_lock:
+            return self._intrinsic_handler_counts.get(scope, 0) > 0
 
     @staticmethod
     def _normalize_handler_result(name: str, result):
@@ -806,6 +1204,37 @@ class ToolRegistry:
         return tool_error(
             f"Tool handler returned unsupported result type: {result_type}",
             error_type="tool_result_contract", tool=name, result_type=result_type)
+
+    def dispatch_bound_intrinsic(
+        self, name: str, expected_entry: ToolEntry, args: dict, receipt_context,
+        *, dispatch_capability=None, scope: Optional[str] = None, **kwargs,
+    ) -> str | dict:
+        """Dispatch one still-current entry with receipt context bound only around its handler."""
+        from tools.intrinsic_approval import bind_intrinsic_approval_receipt_context
+
+        with self._lock:
+            if self._merged_tools(scope).get(name) is not expected_entry:
+                return tool_error("Intrinsic approval denied: tool registration changed")
+            try:
+                with bind_intrinsic_approval_receipt_context(
+                    receipt_context, dispatch_capability
+                ):
+                    with self._intrinsic_handler_scope(scope):
+                        if expected_entry.is_async:
+                            from model_tools import _run_async
+                            result = _run_async(expected_entry.handler(args, **kwargs))
+                        else:
+                            result = expected_entry.handler(args, **kwargs)
+                return self._normalize_handler_result(name, result)
+            except Exception as e:
+                logger.exception("Tool %s dispatch error: %s", name, _bound_error_text(str(e)))
+                raw = f"Tool execution failed: {type(e).__name__}: {e}"
+                try:
+                    from model_tools import _sanitize_tool_error
+                    sanitized = _sanitize_tool_error(raw)
+                except Exception:
+                    sanitized = raw
+                return tool_error(sanitized)
 
     def dispatch(
         self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:

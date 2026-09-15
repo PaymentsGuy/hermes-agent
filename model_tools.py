@@ -802,7 +802,8 @@ def _approval_observability(ids: _CallIds):
 
 
 def _execute_tool(function_name: str, function_args: Dict[str, Any], original_args: Dict[str, Any], ids: _CallIds,
-                  *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool) -> Any:
+                  *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool,
+                  intrinsic_grant=None) -> Any:
     """Run the registry handler (through tool-execution middleware unless skipped)
     with the approval observability context bound for the duration."""
     dispatch_kwargs: Dict[str, Any] = {"task_id": ids.task_id, "session_id": ids.session_id}
@@ -814,6 +815,16 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         dispatch_kwargs["user_task"] = user_task
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
+        if intrinsic_grant is not None:
+            from tools.intrinsic_approval import approved_args_unchanged, approved_profile_unchanged
+            if not approved_args_unchanged(intrinsic_grant, next_args) or not approved_profile_unchanged(intrinsic_grant):
+                return tool_error("Intrinsic approval denied: approved call binding changed")
+            return registry.dispatch_bound_intrinsic(
+                function_name, intrinsic_grant.entry, intrinsic_grant.original_args(),
+                intrinsic_grant.receipt_context,
+                dispatch_capability=intrinsic_grant.dispatch_capability,
+                scope=intrinsic_grant.scope, **dispatch_kwargs,
+            )
         from tools.tool_gateway.names import is_connector_name
         if is_connector_name(function_name):
             from model_tools_connectors import dispatch_connector_call
@@ -859,6 +870,7 @@ def handle_function_call(
     skip_pre_tool_call_hook: bool = False, skip_tool_request_middleware: bool = False,
     skip_tool_execution_middleware: bool = False, tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
+    call_origin: str = "internal", model_tool_policy: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Route a tool call through hooks/middleware to the registry; returns a JSON string.
 
@@ -873,6 +885,13 @@ def handle_function_call(
         function_args = {}
     trace = list(tool_request_middleware_trace or [])
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
+    from agent.model_tool_policy import model_tool_policy_denial
+    if denial := model_tool_policy_denial(
+        function_name, call_origin=call_origin, policy=model_tool_policy,
+    ):
+        # This is deliberately before bridge unwrapping, request/execution middleware,
+        # plugin hooks, observers, and registry dispatch.
+        return tool_error(denial)
     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id)
     start = time.monotonic()
 
@@ -897,12 +916,14 @@ def handle_function_call(
                 underlying[1]["calls"], ids, user_task=user_task,
                 enabled_tools=enabled_tools, middleware_trace=trace,
                 enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+                call_origin=call_origin, model_tool_policy=model_tool_policy,
             ), duration_ms=_elapsed_ms(start))
         return handle_function_call(
             *underlying, **asdict(ids), user_task=user_task, enabled_tools=enabled_tools,
             skip_pre_tool_call_hook=skip_pre_tool_call_hook, skip_tool_request_middleware=skip_tool_request_middleware,
             skip_tool_execution_middleware=skip_tool_execution_middleware, tool_request_middleware_trace=list(trace),
             enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+            call_origin=call_origin, model_tool_policy=model_tool_policy,
         )
 
     from tools.tool_gateway.names import is_connector_name, parse_connector_name
@@ -912,9 +933,28 @@ def handle_function_call(
         if is_connector_name(function_name) and parse_connector_name(function_name) is None:
             return _emit(tool_error("Malformed connector tool name; expected connectors__<connector>__<tool>."))
 
-    original_args = dict(function_args)
+    try:
+        from tools.intrinsic_approval import require_intrinsic_approval
+        intrinsic_grant = require_intrinsic_approval(
+            registry, function_name, function_args,
+            session_id=ids.session_id or "", turn_id=ids.turn_id or "",
+            tool_call_id=ids.tool_call_id or "",
+        )
+    except Exception:
+        # Approval failures are deliberately opaque: plugin-owned preview/raw argument
+        # details must not reach model output or exception logs.
+        return tool_error("Intrinsic approval denied")
+
+    original_args = intrinsic_grant.original_args() if intrinsic_grant is not None else dict(function_args)
+    if intrinsic_grant is not None:
+        function_args = intrinsic_grant.original_args()
     if not skip_tool_request_middleware:
         function_args, original_args, trace = _apply_request_middleware(function_name, function_args, ids, trace)
+    if intrinsic_grant is not None:
+        from tools.intrinsic_approval import approved_args_unchanged
+        if not approved_args_unchanged(intrinsic_grant, function_args):
+            return tool_error("Intrinsic approval denied: tool arguments changed after approval")
+        function_args = intrinsic_grant.original_args()
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
@@ -924,6 +964,11 @@ def handle_function_call(
         if blocked is not None:
             result, error_type, error_message = blocked
             return _emit(result, status="blocked", error_type=error_type, error_message=error_message)
+        if intrinsic_grant is not None:
+            from tools.intrinsic_approval import approved_args_unchanged
+            if not approved_args_unchanged(intrinsic_grant, function_args):
+                return tool_error("Intrinsic approval denied: tool arguments changed after approval")
+            function_args = intrinsic_grant.original_args()
 
         # Any non-read/search tool resets the consecutive-read-loop counter.
         if function_name not in _READ_SEARCH_TOOLS:
@@ -936,7 +981,8 @@ def handle_function_call(
         # duration_ms (monotonic) is exposed to post_tool_call / transform_tool_result.
         start = time.monotonic()
         result = _execute_tool(function_name, function_args, original_args, ids, user_task=user_task,
-                               enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
+                               enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware,
+                               intrinsic_grant=intrinsic_grant)
         duration_ms = _elapsed_ms(start)
         _emit(result, duration_ms=duration_ms)
         return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)

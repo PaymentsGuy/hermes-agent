@@ -1,7 +1,8 @@
 """Background memory/skill review — fork the agent to evaluate the turn. After every turn
 ``AIAgent.run_conversation`` may spawn a daemon thread that replays the conversation snapshot in a
-forked :class:`AIAgent` and asks "should any skill/memory be saved or updated?". Writes go
-straight to the memory + skill stores; the main conversation and prompt cache are never touched.
+forked :class:`AIAgent` and asks "should any skill/memory be saved or updated?". Reviews either
+apply through the memory/skill tools or submit through one configured proposal tool; the main
+conversation and prompt cache are never touched.
 The fork inherits the parent's live runtime (provider, model, credentials, cached system prompt)
 so it hits the same prefix cache, and runs under a dispatch-side tool whitelist."""
 
@@ -155,23 +156,100 @@ _REVIEW_MAX_ITERATIONS = 16
 _REVIEW_MAX_INPUT_TOKENS_DEFAULT = 600_000
 
 
+class _InvalidBackgroundReviewConfig(dict):
+    """Empty task config carrying a failed or malformed config read to review preflight."""
+
+
 def _task_block(cfg: Any) -> Dict[str, Any]:
-    """``cfg["auxiliary"]["background_review"]`` as a dict (``{}`` on any shape mismatch)."""
-    aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
-    task = aux.get("background_review", {})
-    return task if isinstance(task, dict) else {}
+    """Return a valid ``cfg["auxiliary"]["background_review"]`` mapping."""
+    if not isinstance(cfg, dict):
+        raise ValueError("Hermes config must be a mapping")
+    aux = cfg.get("auxiliary", {})
+    if not isinstance(aux, dict):
+        raise ValueError("auxiliary config must be a mapping")
+    if "background_review" not in aux:
+        return {}
+    task = aux["background_review"]
+    if not isinstance(task, dict):
+        raise ValueError("auxiliary.background_review must be a mapping")
+    return task
 
 
 def _background_review_task_config(task_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """``auxiliary.background_review`` (or ``{}`` on any failure); pass a pre-loaded ``task_cfg``
-    so the spawn / resolve / prompt paths do not re-read config on every turn."""
+    """Return a supplied valid task mapping, otherwise load and validate it."""
+    if isinstance(task_cfg, _InvalidBackgroundReviewConfig):
+        raise ValueError("Background review config is unavailable or malformed")
     if task_cfg is not None:
-        return task_cfg if isinstance(task_cfg, dict) else {}
+        if not isinstance(task_cfg, dict):
+            raise ValueError("auxiliary.background_review must be a mapping")
+        return task_cfg
     try:
         from hermes_cli.config import load_config_readonly
-        return _task_block(load_config_readonly())
-    except Exception:
-        return {}
+        cfg = load_config_readonly()
+    except Exception as e:
+        raise ValueError("Background review config is unavailable") from e
+    return _task_block(cfg)
+
+
+def _background_review_mode(task_cfg: Optional[Dict[str, Any]]) -> str:
+    """Return apply only for an omitted mode; reject every explicit invalid value."""
+    task = _background_review_task_config(task_cfg)
+    if "mode" not in task:
+        return "apply"
+    raw_mode = task["mode"]
+    if not isinstance(raw_mode, str):
+        raise ValueError(
+            "auxiliary.background_review.mode must be 'apply' or 'propose'"
+        )
+    mode = raw_mode.strip().lower()
+    if mode not in {"apply", "propose"}:
+        raise ValueError(
+            "auxiliary.background_review.mode must be 'apply' or 'propose'"
+        )
+    return mode
+
+
+def _configured_extra_tools(task_cfg: Optional[Dict[str, Any]]) -> set[str]:
+    raw = _background_review_task_config(task_cfg).get("extra_tools", [])
+    if not isinstance(raw, list):
+        return set()
+    return {name.strip() for name in raw if isinstance(name, str) and name.strip()}
+
+
+def _configured_proposal_tool(task_cfg: Optional[Dict[str, Any]]) -> str:
+    raw_name = _background_review_task_config(task_cfg).get("proposal_tool", "")
+    if not isinstance(raw_name, str) or not (name := raw_name.strip()):
+        raise ValueError(
+            "auxiliary.background_review.proposal_tool must be a non-empty string in propose mode"
+        )
+    if name in {"memory", "skill_manage"}:
+        raise ValueError(
+            f"Background review proposal tool {name!r} cannot be a direct mutation tool"
+        )
+    return name
+
+
+def _proposal_tool(agent: Any, task_cfg: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Validate proposal-mode authority against config and the parent's frozen tool surface."""
+    if _background_review_mode(task_cfg) != "propose":
+        return None
+    name = _configured_proposal_tool(task_cfg)
+    if name not in _configured_extra_tools(task_cfg):
+        raise ValueError(
+            f"Background review proposal tool {name!r} must be configured in extra_tools"
+        )
+    parent_tool_names = {
+        function.get("name")
+        for tool in (getattr(agent, "tools", None) or [])
+        if isinstance(tool, dict)
+        and isinstance((function := tool.get("function")), dict)
+        and function.get("name")
+    }
+    if name not in parent_tool_names:
+        raise ValueError(
+            f"Background review proposal tool {name!r} is unavailable in the parent tool schema"
+        )
+    return name
 
 
 def _review_input_token_budget(task_cfg: Optional[Dict[str, Any]] = None) -> Optional[int]:
@@ -185,8 +263,11 @@ def _review_input_token_budget(task_cfg: Optional[Dict[str, Any]] = None) -> Opt
 
 
 def load_background_review_settings() -> tuple[bool, Dict[str, Any]]:
-    """Single config read -> ``(enabled, task_cfg)``. Fail-open (``enabled=True``) so a broken
-    config never silently disables reviews — but WARN so the cost is visible."""
+    """Single config read -> ``(enabled, task_cfg)``.
+
+    Enabled remains fail-open for compatibility, while an invalid task marker makes mode
+    preflight fail closed before a fork or provider call.
+    """
     try:
         from hermes_cli.config import load_config_readonly
         from utils import is_truthy_value
@@ -194,11 +275,11 @@ def load_background_review_settings() -> tuple[bool, Dict[str, Any]]:
         return is_truthy_value(task.get("enabled"), default=True), task
     except Exception:
         logger.warning(
-            "Failed to read background_review.enabled; leaving automatic "
-            "review enabled (fail-open)",
+            "Failed to read background_review settings; leaving automatic review "
+            "enabled but blocking review execution (fail-closed)",
             exc_info=True,
         )
-        return True, {}
+        return True, _InvalidBackgroundReviewConfig()
 
 
 def _resolve_review_runtime(agent: Any, task_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -826,6 +907,8 @@ def _fork_init_kwargs(agent: Any, rt: Dict[str, Any], routed: bool, max_iteratio
     namespace; built-in MEMORY.md/USER.md state is re-bound by the caller. Toolsets match the
     parent so ``tools[]`` is byte-identical (Anthropic's cache key includes it); the runtime
     whitelist restricts dispatch."""
+    from agent.model_tool_policy import inherit_model_tool_policy
+
     kwargs: Dict[str, Any] = {
         "model": rt.get("model") or agent.model, "max_iterations": max_iterations, "quiet_mode": True,
         "platform": agent.platform, "provider": rt.get("provider") or agent.provider,
@@ -834,6 +917,7 @@ def _fork_init_kwargs(agent: Any, rt: Dict[str, Any], routed: bool, max_iteratio
         "request_overrides": rt.get("request_overrides") or {}, "parent_session_id": agent.session_id,
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None),
         "disabled_toolsets": getattr(agent, "disabled_toolsets", None), "skip_memory": True,
+        "model_tool_policy": inherit_model_tool_policy(agent),
     }
     if isinstance(rt.get("max_tokens"), int):
         kwargs["max_tokens"] = rt["max_tokens"]
@@ -960,6 +1044,10 @@ def _review_tool_whitelist(
     """``(whitelist, configured_extra_tools)`` for the review fork — DISPATCH-side only, so the
     advertised ``tools[]`` stays byte-identical to the parent's (prompt-cache parity)."""
     from model_tools import get_tool_definitions
+    if _background_review_mode(task_cfg) == "propose":
+        proposal_tool = _configured_proposal_tool(task_cfg)
+        read_tools = {"skill_view", "skills_list", "read_file", "search_files"}
+        return read_tools | {proposal_tool}, {proposal_tool}
     # Gate the built-in memory tool on BOTH the profile's memory flags and the trigger that fired
     # (#105921): a skill-nudge review never gets the memory tool, so an unattended fork cannot
     # act on the memory tool's "consolidate now" hint and delete entries no one reviewed.
@@ -987,13 +1075,7 @@ def _review_tool_whitelist(
     # human-gated proposal tool or a memory-provider write surface. Read from task_cfg (the
     # auxiliary.background_review block already loaded for this spawn) so no extra config I/O happens per
     # review.
-    configured_extra_tools: set = set()
-    try:
-        extra_raw = _background_review_task_config(task_cfg).get("extra_tools", [])
-        if isinstance(extra_raw, list):
-            configured_extra_tools = {name.strip() for name in extra_raw if isinstance(name, str) and name.strip()}
-    except Exception:
-        logger.debug("background_review extra_tools parse failed", exc_info=True)
+    configured_extra_tools = _configured_extra_tools(task_cfg)
     return whitelist | configured_extra_tools, configured_extra_tools
 
 
@@ -1023,6 +1105,7 @@ def _run_review_fork(
     so the caller's error path still sees usage and the fork to clean up. ``explicit`` (/refine)
     keeps the ``background_review`` origin (curator/skill guards still apply) but marks the fork
     attended, so the unattended-only memory delete gate leaves the full operation set available."""
+    proposal_tool = _proposal_tool(agent, task_cfg)
     st.review_agent, _rt, _routed = build_cache_parity_fork(
         agent, task_cfg, max_iterations=_REVIEW_MAX_ITERATIONS)
     st.review_agent._review_attended = explicit
@@ -1036,15 +1119,32 @@ def _run_review_fork(
     # tell the model that memory is available, or it will burn iterations on denied calls.
     memory_phrase_deny = " and memory for notes (add only)" if "memory" in review_whitelist else ""
     memory_phrase_prompt = "memory and skill " if "memory" in review_whitelist else "skill "
-    set_thread_tool_whitelist(
-        review_whitelist,
-        deny_msg_fmt=(
+    if proposal_tool:
+        deny_proposal_tool = proposal_tool.replace("{", "{{").replace("}", "}}")
+        deny_message = (
+            "Background review denied non-whitelisted tool: {tool_name}. Allowed here: "
+            f"skill_view/skills_list/read_file/search_files to read and {deny_proposal_tool} "
+            "as the sole persistence action. Do not retry {tool_name}."
+        )
+        prompt_suffix = (
+            f"\n\nProposal mode: {proposal_tool} is the sole persistence action. "
+            "Use skill_view, skills_list, read_file, and search_files only for reading. "
+            "Do not perform direct memory or skill mutation; do not call memory or skill_manage. "
+            f"Submit any proposed persistent change only through {proposal_tool}."
+        )
+    else:
+        deny_message = (
             "Background review denied non-whitelisted tool: "
             "{tool_name}. Allowed here: skill_view/skills_list/read_file/search_files to read, "
             "skill_manage(action='patch'|...) to change skills"
             + memory_phrase_deny + "." + deny_extra + " Do not retry {tool_name}."
-        ),
-    )
+        )
+        prompt_suffix = (
+            "\n\nYou can only call " + memory_phrase_prompt +
+            "management tools. Other tools will be denied "
+            "at runtime — do not attempt them." + prompt_extra
+        )
+    set_thread_tool_whitelist(review_whitelist, deny_msg_fmt=deny_message)
     with suppress(Exception):
         from tools.skill_manager_guards import _reset_background_review_read_marks
 
@@ -1053,11 +1153,7 @@ def _run_review_fork(
         if review_run is None or review_run.begin_request(st.review_agent):
             # Routed -> digest (cache cold anyway); same model -> full snapshot (warm cache reads).
             st.review_agent.run_conversation(
-                user_message=(
-                    prompt + "\n\nYou can only call " + memory_phrase_prompt +
-                    "management tools. Other tools will be denied "
-                    "at runtime — do not attempt them." + prompt_extra
-                ),
+                user_message=prompt + prompt_suffix,
                 conversation_history=_digest_history(messages_snapshot) if _routed else messages_snapshot,
             )
     finally:
@@ -1099,6 +1195,13 @@ def _run_review_in_thread(
     """
     if review_run is not None and review_run.cancel_requested.is_set():
         finish_background_review_run(agent, review_run)
+        return
+    try:
+        _proposal_tool(agent, task_cfg)
+    except ValueError as e:
+        logger.warning("Background memory/skill review failed: %s", e)
+        finish_background_review_run(agent, review_run)
+        agent._emit_auxiliary_failure("background review", e)
         return
     _set_thread_approval_callback(_bg_review_auto_deny)
     # A client that can't carry Hermes tool calls back would spawn a fork that cannot write

@@ -520,6 +520,51 @@ def register(ctx):
     ctx.register_hook("post_tool_call", _on_post_tool_call)
 ```
 
+Tools that must always enter the host's human-approval path can declare intrinsic
+registration metadata. The preview resolver is synchronous and read-only: it receives
+a detached JSON copy of the original tool arguments plus an immutable context with
+`tool_name`, `session_id`, `profile_name`, and `tool_call_id`. It must return a
+JSON-serializable mapping whose canonical UTF-8 JSON is no larger than 24 KiB.
+
+```python
+def preview_delete(args, context):
+    return {
+        "action": "Delete record",
+        "record_id": args["record_id"],
+        "tool_call_id": context.tool_call_id,
+    }
+
+
+def register(ctx):
+    ctx.register_tool(
+        name="delete_record",
+        toolset="records",
+        schema=DELETE_RECORD_SCHEMA,
+        handler=delete_record,
+        human_approval="always",
+        approval_preview=preview_delete,
+    )
+```
+
+V1 accepts only `None` (the legacy default) or the exact string `"always"`.
+`"always"` requires the resolver; a resolver without `"always"`, an async resolver,
+non-mapping output, non-finite/non-JSON values, resolver exceptions, and oversized
+output are rejected. This metadata is registry-owned and is never added to the
+model-visible tool schema or tool arguments. The preview resolver receives no handler,
+dispatch context, or host capability, and registering this metadata does not itself
+approve or execute anything.
+
+An approval preview may include one exact downstream envelope as
+`approved_dispatch: {"tool_name": "skill_manage", "arguments": {...}}`.
+Inside the approved handler only, `ctx.dispatch_approved_tool(name, arguments)` may
+submit that byte-equivalent canonical envelope once. Missing, changed, direct, or
+replayed dispatches are denied. The handler can inspect the host receipt with
+`get_intrinsic_approval_receipt_context()`; the receipt and dispatch capability are
+host context, never model arguments. A guarded `skill_manage` patch still enforces its
+own owner, raw-byte precondition/result, write-approval, and sync-suppression rules.
+Authorization-scope fields bind and correlate the approved preview; they are not
+credentials or authentication tokens.
+
 **What `register()` does:**
 - Called exactly once at startup
 - `ctx.register_tool()` puts your tool in the registry — the model sees it immediately

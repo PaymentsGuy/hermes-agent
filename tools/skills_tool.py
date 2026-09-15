@@ -22,7 +22,8 @@ from tools.skills_tool_setup import (  # noqa: F401
     _get_required_environment_variables, _is_env_var_persisted, _is_remote_env_backend)
 from tools.skills_tool_plugin import (  # noqa: F401
     MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, _INJECTION_PATTERNS, _fail, _json,
-    _mark_background_review_read, _preprocess_skill, _read_skill_text, _safe_frontmatter,
+    _decode_skill_bytes, _mark_background_review_read, _preprocess_skill, _raw_file_fields,
+    _read_authorized_file_bytes, _read_skill_text, _safe_frontmatter,
     _serve_plugin_skill, _serve_skill_file, _truncate_description)
 from tools.skills_tool_dedup import (  # noqa: F401
     _check_skill_view_dedup, _record_skill_view, reset_skill_view_dedup)
@@ -264,7 +265,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         return tool_error(str(e), success=False)
 
 
-def _resolve_plugin_skill(name, file_path, task_id, preprocess):
+def _resolve_plugin_skill(name, file_path, task_id, preprocess, raw_identity, raw_text):
     """``plugin:skill`` dispatch: ``(result_json, None)`` when answered, else ``(None,
     local_category_name)`` to fall through to the flat-tree scan — categorized local skills also use
     ``category:skill`` in config/gateway prompts, so the on-disk ``category/skill`` form returns."""
@@ -299,7 +300,8 @@ def _resolve_plugin_skill(name, file_path, task_id, preprocess):
             f"has been cleaned up — try again after the plugin is reloaded."), None
     if plugin_skill_md is not None:
         return _serve_plugin_skill(
-            plugin_skill_md, namespace, bare, file_path=file_path, preprocess=preprocess, session_id=task_id), None
+            plugin_skill_md, namespace, bare, file_path=file_path, preprocess=preprocess,
+            session_id=task_id, raw_identity=raw_identity, raw_text=raw_text), None
     if available := pm.list_plugin_skills(namespace):  # plugin exists but this specific skill is missing
         return _fail(
             f"Skill '{bare}' not found in plugin '{namespace}'.",
@@ -517,19 +519,25 @@ def _log_security_warnings(name: str, skill_md: Path, content: str, all_dirs, ac
 
 
 def skill_view(
-    name: str, file_path: str = None, task_id: str = None, preprocess: bool = True) -> str:
+    name: str, file_path: str = None, task_id: str = None, preprocess: bool = True,
+    raw_identity: bool = False, raw_text: bool = False) -> str:
     """View a skill (SKILL.md) or a file within its directory, as JSON. ``name`` is a skill name
     or path ("axolotl", "03-fine-tuning/axolotl"); "plugin:skill" resolves plugin-provided
     skills. ``preprocess`` applies the configured SKILL.md template / inline shell rendering;
     slash/preload callers render the message themselves."""
     try:
+        if type(raw_identity) is not bool or type(raw_text) is not bool:
+            return _fail("raw_identity and raw_text must be literal booleans.")
+        if raw_text and not raw_identity:
+            return _fail("raw_text requires raw_identity=true.")
         # Validate before the ':' dispatch so a Windows drive path (C:\skills\foo) can't be
         # reinterpreted as a plugin namespace.
         if lookup_error := _skill_lookup_path_error(name):
             return _fail(lookup_error, hint=_LOOKUP_HINT)
         local_category_name: str | None = None
         if ":" in name:  # plugin registry; bare names use the flat-tree scan below
-            served, local_category_name = _resolve_plugin_skill(name, file_path, task_id, preprocess)
+            served, local_category_name = _resolve_plugin_skill(
+                name, file_path, task_id, preprocess, raw_identity, raw_text)
             if served is not None:
                 return served
         # The fall-through form (namespace/bare) joins onto each search dir too; re-validate it
@@ -541,10 +549,11 @@ def skill_view(
             name, local_category_name, project_dirs, all_dirs)
         if error is not None:
             return error
-        try:  # read once — reused for platform check and main content
-            content = _read_skill_text(skill_md)
+        try:  # one authorized snapshot feeds checks, rendering, and optional raw fields
+            data = _read_authorized_file_bytes(skill_md, skill_dir or skill_md.parent)
         except Exception as e:
             return _fail(f"Failed to read skill '{name}': {e}")
+        content = _decode_skill_bytes(data)
         _log_security_warnings(name, skill_md, content, all_dirs, active_skills_dir)
         frontmatter = _safe_frontmatter(content=content)
         if not skill_matches_platform(frontmatter):
@@ -555,7 +564,8 @@ def skill_view(
         if file_path and skill_dir:
             return _serve_skill_file(
                 skill_dir, file_path, name, list_available=True, mark_read=True,
-                hint="Use a relative path within the skill directory")
+                hint="Use a relative path within the skill directory",
+                raw_identity=raw_identity, raw_text=raw_text)
         # tags/related_skills: metadata.hermes.* (agentskills.io) first, then top-level.
         metadata = frontmatter.get("metadata")
         hermes_meta = (metadata.get("hermes", {}) or {}) if isinstance(metadata, dict) else {}
@@ -576,6 +586,12 @@ def skill_view(
                 org_provenance, header = _org_provenance_header(skill_dir, active_skills_dir)
             except Exception:
                 logger.debug("Could not resolve org provenance for %s", skill_name, exc_info=True)
+        raw_path = "SKILL.md" if skill_dir else skill_md.name
+        raw_fields, raw_error = _raw_file_fields(
+            data, raw_path, raw_identity=raw_identity, raw_text=raw_text
+        )
+        if raw_error:
+            return _fail(raw_error)
         result = {
             "success": True, "name": skill_name, "description": frontmatter.get("description", ""),
             "tags": tags, "related_skills": related_skills, "content": header + rendered_content,
@@ -586,7 +602,7 @@ def skill_view(
             **readiness,
             # Internal: absolute source path for the repeat-view dedup fingerprint.
             "_source_path": str(skill_md),
-            **readiness_extras}
+            **readiness_extras, **raw_fields}
         _mark_background_review_read(skill_md)
         if frontmatter.get("compatibility"):  # agentskills.io optional fields
             result["compatibility"] = frontmatter["compatibility"]
@@ -626,6 +642,14 @@ SKILL_VIEW_SCHEMA = {
                 "type": "string",
                 "description": "OPTIONAL: Path to a linked file within the skill (e.g., 'references/api.md', 'templates/config.yaml', 'scripts/validate.py'). Omit to get the main SKILL.md content.",
             },
+            "raw_identity": {
+                "type": "boolean",
+                "description": "OPTIONAL: Include an exact-byte manifest for the one requested SKILL.md or support file.",
+            },
+            "raw_text": {
+                "type": "boolean",
+                "description": "OPTIONAL: Include exact strict UTF-8 raw text. Requires raw_identity=true.",
+            },
         },
         "required": ["name"],
     },
@@ -641,15 +665,26 @@ def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count/use on success (best-effort). Repeat-view dedup
     mirrors read_file's unchanged-stub: a SAME, unchanged skill file already loaded in this
     session returns a short stub (cache cleared on context compression)."""
+    raw_identity = args.get("raw_identity", False)
+    raw_text = args.get("raw_text", False)
+    if type(raw_identity) is not bool or type(raw_text) is not bool:
+        return _fail("raw_identity and raw_text must be literal booleans.")
+    if raw_text and not raw_identity:
+        return _fail("raw_text requires raw_identity=true.")
     name = args.get("name", "")
     task_id = kw.get("task_id")
-    if (stub := _check_skill_view_dedup(task_id, name, args.get("file_path"))) is not None:
+    wants_raw = raw_identity or raw_text
+    if not wants_raw and (
+            stub := _check_skill_view_dedup(task_id, name, args.get("file_path"))) is not None:
         return stub
-    result = skill_view(name, file_path=args.get("file_path"), task_id=task_id)
+    result = skill_view(
+        name, file_path=args.get("file_path"), task_id=task_id,
+        raw_identity=raw_identity, raw_text=raw_text)
     with suppress(Exception):
         parsed = json.loads(result)
         if isinstance(parsed, dict) and parsed.get("success"):
-            _record_skill_view(task_id, name, args.get("file_path"), parsed)
+            if not wants_raw:
+                _record_skill_view(task_id, name, args.get("file_path"), parsed)
             if resolved := parsed.get("name") or name:  # qualified forms return the canonical name
                 from tools.skill_usage import bump_use, bump_view
                 bump_view(str(resolved))

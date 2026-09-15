@@ -2235,8 +2235,26 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     from agent.inline_tool_executors import (
         InlineToolContext, emit_terminal_post_tool_call, resolve_invoke_tool_executor, tool_hook_ids
     )
+    from agent.model_tool_policy import model_tool_policy_denial
+    if denial := model_tool_policy_denial(
+        function_name, call_origin="model", policy=getattr(agent, "model_tool_policy", None),
+    ):
+        return json.dumps({"error": denial}, ensure_ascii=False)
     if not isinstance(function_args, dict):
         function_args = {}
+    import model_tools
+    entry = model_tools.registry.get_entry(function_name)
+    if entry is not None and entry.human_approval == "always":
+        return model_tools.handle_function_call(
+            function_name, function_args, effective_task_id,
+            tool_call_id=tool_call_id, session_id=agent.session_id or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+            enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            call_origin="model", model_tool_policy=getattr(agent, "model_tool_policy", None),
+        )
     hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id)
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
@@ -2289,6 +2307,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
+                call_origin="model", model_tool_policy=getattr(agent, "model_tool_policy", None),
             )
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True

@@ -35,7 +35,8 @@ _IMPORT_SESSION_INSERT_SQL = """INSERT INTO sessions (
                            cwd, git_branch, git_repo_root,
                            billing_provider, billing_base_url, billing_mode,
                            estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
-                           pricing_version, title, api_call_count, archived
+                           pricing_version, title, api_call_count, archived,
+                           model_tool_policy_version, model_tool_policy
                        )
                        VALUES (
                            :id, :source, :user_id, :model, :model_config,
@@ -46,7 +47,8 @@ _IMPORT_SESSION_INSERT_SQL = """INSERT INTO sessions (
                            :billing_provider, :billing_base_url, :billing_mode,
                            :estimated_cost_usd, :actual_cost_usd, :cost_status,
                            :cost_source, :pricing_version, :title,
-                           :api_call_count, :archived
+                           :api_call_count, :archived,
+                           :model_tool_policy_version, :model_tool_policy
                        )"""
 # Columns copied verbatim from the payload; typed columns are converted below.
 _IMPORT_PASSTHROUGH_COLS = (
@@ -379,9 +381,20 @@ class SessionPortabilityMixin:
 
     def _normalize_import_session(self, raw: Dict[str, Any], session_id: str, messages: list) -> Dict[str, Any]:
         """Type-check one payload session + its messages; raises ValueError."""
+        from agent.model_tool_policy import (
+            MODEL_TOOL_POLICY_VERSION,
+            decode_model_tool_policy_carrier,
+            encode_model_tool_policy,
+        )
+
         clean_session = dict(raw)
         clean_session["id"] = session_id
         clean_session["model_config"] = self._import_json_object_or_none(clean_session.get("model_config"), "model_config")
+        policy = decode_model_tool_policy_carrier(
+            clean_session.get("model_tool_policy_version"), clean_session.get("model_tool_policy"),
+        )
+        clean_session["model_tool_policy_version"] = MODEL_TOOL_POLICY_VERSION if policy is not None else None
+        clean_session["model_tool_policy"] = encode_model_tool_policy(policy) if policy is not None else None
         for field in ("parent_session_id", *_IMPORT_SESSION_TEXT_FIELDS):
             clean_session[field] = self._import_text_or_none(clean_session.get(field), field)
         clean_messages: List[Dict[str, Any]] = []
@@ -456,6 +469,8 @@ class SessionPortabilityMixin:
             "system_prompt_hash": self._store_system_prompt(conn, raw.get("system_prompt")),
             "started_at": time.time() if started_at is None else started_at,
             "archived": 1 if raw.get("archived") else 0,
+            "model_tool_policy_version": raw.get("model_tool_policy_version"),
+            "model_tool_policy": raw.get("model_tool_policy"),
             **{col: raw.get(col) for col in _IMPORT_PASSTHROUGH_COLS},
             **{col: self._coerce_or(raw.get(col), float, None) for col in _IMPORT_FLOAT_COLS},
             **{col: self._coerce_or(raw.get(col), int, 0) for col in _IMPORT_INT_COLS},
@@ -470,8 +485,7 @@ class SessionPortabilityMixin:
         conn.execute("UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                      (total_messages, total_tool_calls, session_id))
 
-    @staticmethod
-    def _attach_import_parents(conn, parent_updates: List[tuple]) -> int:
+    def _attach_import_parents(self, conn, parent_updates: List[tuple]) -> int:
         """Re-attach imported children whose parent exists (in the store or the same payload)
         without creating a cycle; returns the detached count. Only the closing edge of a
         cycle is dropped, so later entries can still attach to the now-root session."""
@@ -497,8 +511,24 @@ class SessionPortabilityMixin:
 
         detached = 0
         for session_id, parent_id in parent_updates:
-            parent_exists = conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (parent_id,)).fetchone()
-            if parent_exists and not _would_create_cycle(session_id, parent_id):
+            parent = conn.execute("SELECT * FROM sessions WHERE id = ? LIMIT 1", (parent_id,)).fetchone()
+            if parent is not None and not _would_create_cycle(session_id, parent_id):
+                child = dict(conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone())
+                child["parent_session_id"] = parent_id
+                raw_config = child.get("model_config")
+                config = safe_json_loads(raw_config, default={}) if isinstance(raw_config, str) else {}
+                inherited_branch = isinstance(config, dict) and config.get("_branched_from") == parent_id
+                compression_continuation = (
+                    parent["end_reason"] == "compression"
+                    and not getattr(self, "_is_explicit_fork_child_row")(child)
+                )
+                if inherited_branch or compression_continuation:
+                    from agent.model_tool_policy import require_matching_model_tool_policy_carriers
+                    require_matching_model_tool_policy_carriers(
+                        parent["model_tool_policy_version"], parent["model_tool_policy"],
+                        child["model_tool_policy_version"], child["model_tool_policy"],
+                        context=("imported branch" if inherited_branch else "imported compression continuation"),
+                    )
                 conn.execute("UPDATE sessions SET parent_session_id = ? WHERE id = ?", (parent_id, session_id))
             else:
                 parent_by_child.pop(session_id, None)
@@ -529,13 +559,24 @@ class SessionPortabilityMixin:
             return {"ok": False, "imported": 0, "skipped": 0, "detached": 0, "errors": errors}
 
         def _do(conn):
+            from agent.model_tool_policy import require_matching_model_tool_policy_carriers
+
             imported_ids: List[str] = []
             skipped_ids: List[str] = []
             parent_updates: List[tuple[str, str]] = []
             for item in normalized:
                 raw = item["session"]
                 session_id = str(raw.get("id") or "").strip()
-                if conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone():
+                existing = conn.execute(
+                    "SELECT model_tool_policy_version, model_tool_policy FROM sessions WHERE id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if existing is not None:
+                    require_matching_model_tool_policy_carriers(
+                        existing["model_tool_policy_version"], existing["model_tool_policy"],
+                        raw.get("model_tool_policy_version"), raw.get("model_tool_policy"),
+                        context=f"existing session {session_id!r} import",
+                    )
                     skipped_ids.append(session_id)
                     continue
                 self._import_session_row(conn, raw, item["messages"], session_id)
@@ -549,4 +590,13 @@ class SessionPortabilityMixin:
                 "imported_ids": imported_ids, "skipped_ids": skipped_ids, "errors": [],
             }
 
-        return self._execute_write(_do)
+        try:
+            return self._execute_write(_do)
+        except Exception as exc:
+            from agent.model_tool_policy import ModelToolPolicyContinuityError
+            if not isinstance(exc, ModelToolPolicyContinuityError):
+                raise
+            return {
+                "ok": False, "imported": 0, "skipped": 0, "detached": 0,
+                "errors": [{"error": str(exc)}],
+            }

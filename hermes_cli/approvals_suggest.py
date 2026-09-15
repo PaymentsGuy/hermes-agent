@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -354,6 +355,32 @@ def suggest_command(args) -> int:
     return 0
 
 
+def _verify_receipt_command(args) -> int:
+    """Run the bounded approval-receipt consume command without leaking failures."""
+    try:
+        from tools.tool_approval_receipts import verify_and_consume_intrinsic_approval_receipt
+
+        result = verify_and_consume_intrinsic_approval_receipt(
+            receipt_id=args.receipt_id,
+            session_id=args.session_id,
+            tool_name=args.tool_name,
+            approval_scope_sha256=args.approval_scope_sha256,
+            consume_id=args.consume_id,
+        )
+    except Exception:
+        message = "approval receipt verification failed"
+        if getattr(args, "json", False):
+            print(json.dumps({"error": message}))
+        else:
+            print(f"Error: {message}", file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(dict(result)))
+    else:
+        print(f"Approved receipt consumed: {result['receipt_id']}")
+    return 0
+
+
 def approvals_command(args) -> int:
     """Dispatch ``hermes approvals <subcommand>``."""
     sub = getattr(args, "approvals_command", None)
@@ -362,6 +389,8 @@ def approvals_command(args) -> int:
     if sub == "test":
         from hermes_cli.approvals_test import approvals_test_command
         return approvals_test_command(args)
+    if sub == "verify-receipt":
+        return _verify_receipt_command(args)
     print(
         "usage: hermes approvals <subcommand>\n"
         "\n"
@@ -370,6 +399,8 @@ def approvals_command(args) -> int:
         "             command_allowlist (dry by default; --apply N,M to merge)\n"
         "  test       Dry-run the approval verdict for a command without\n"
         "             executing it (exit 0 allow / 2 ask / 3 deny)\n"
+        "  verify-receipt\n"
+        "             Verify exact bindings and atomically consume a receipt\n"
         "\n"
         "Run `hermes approvals <subcommand> -h` for details."
     )

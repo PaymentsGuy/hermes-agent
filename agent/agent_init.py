@@ -1084,6 +1084,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     agent.tools = model_tools.get_tool_definitions(
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        skip_tool_search_assembly=agent.model_tool_policy is not None,
     )
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
@@ -2228,6 +2229,7 @@ def init_agent(
     checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None,
+    model_tool_policy: Optional[Dict[str, Any]] = None,
 ):
     """Initialize the AI Agent (body of :meth:`AIAgent.__init__`).
 
@@ -2276,10 +2278,17 @@ def init_agent(
         key: value for key, value in (capabilities or {}).items()
         if isinstance(key, str) and isinstance(value, bool)
     }
+    if model_tool_policy is None:
+        agent.model_tool_policy = None
+    else:
+        from agent.model_tool_policy import normalize_model_tool_policy
+        agent.model_tool_policy = normalize_model_tool_policy(model_tool_policy)
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
     _resolve_api_mode(agent, api_mode, provider_name, base_url)
+    from agent.model_tool_policy import enforce_model_tool_policy_runtime
+    enforce_model_tool_policy_runtime(agent.model_tool_policy, agent.api_mode)
     _finalize_routing(agent, api_mode, credential_pool)
 
     # Platform callbacks are stored under their parameter names verbatim.
@@ -2325,6 +2334,13 @@ def init_agent(
     _enforce_minimum_context(agent)
     _warn_nonagentic_hermes_model(agent)
     _inject_context_engine_tools(agent)
+    if agent.model_tool_policy is not None:
+        from agent.model_tool_policy import apply_model_tool_policy
+        agent.tools = apply_model_tool_policy(agent.model_tool_policy, agent.tools or [])
+        agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
+        agent._context_engine_tool_names.intersection_update(agent.valid_tool_names)
+        from agent.prompt_builder import KANBAN_GUIDANCE
+        agent._kanban_worker_guidance = KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
     _init_usage_state(agent)
     _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _emit_compression_summary(agent, cs)

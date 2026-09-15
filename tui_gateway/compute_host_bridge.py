@@ -50,6 +50,19 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
 def _compute_host_turn_frame(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None, display_kind: str | None = None) -> dict:
+    agent_db = getattr(session.get("agent"), "_session_db", None)
+    if agent_db is not None:
+        model_tool_policy = _validated_session_model_tool_policy(session, agent_db)
+    else:
+        with _session_db(session) as db:
+            model_tool_policy = _validated_session_model_tool_policy(session, db)
+    policy_carrier = {}
+    if model_tool_policy is not None:
+        from agent.model_tool_policy import MODEL_TOOL_POLICY_VERSION
+        policy_carrier = {
+            "model_tool_policy": model_tool_policy,
+            "model_tool_policy_version": MODEL_TOOL_POLICY_VERSION,
+        }
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
@@ -66,7 +79,7 @@ def _compute_host_turn_frame(
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session), "attached_images": attached_images,
-        "queued_prompt_generation": queued_prompt_generation}
+        "queued_prompt_generation": queued_prompt_generation, **policy_carrier}
 
 
 def _metadata_mirror(session: dict | None) -> dict:

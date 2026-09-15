@@ -1441,6 +1441,10 @@ def _run_conversation_turn(
     store when ``user_message`` carries API-only synthetic prefixes; timestamp / platform id are
     stored as metadata (platform id lets restart drain recovery dedup). ``persist_user_display_*``:
     display-only event rendering; the model still receives the message unchanged."""
+    from agent.model_tool_policy import enforce_model_tool_policy_runtime
+    enforce_model_tool_policy_runtime(
+        getattr(agent, "model_tool_policy", None), getattr(agent, "api_mode", None)
+    )
     if moa_config is None:
         user_message, moa_config, persist_user_message = _decode_inline_moa_turn(
             user_message, persist_user_message

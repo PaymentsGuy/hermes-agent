@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
 
+from agent.model_tool_policy import MODEL_TOOL_POLICY_VERSION
 from hermes_state import SessionDB
 
 
@@ -22,6 +24,15 @@ def _compression_parent(db: SessionDB, session_id: str = "parent") -> None:
     db.create_session(session_id, source="webui")
     db.append_message(session_id, "user", "before split")
     db.end_session(session_id, "compression")
+
+
+def _model_tool_policy(*allowed_tools: str) -> dict:
+    return {
+        "policy_id": "compression-policy",
+        "policy_sha256": "a" * 64,
+        "allowed_tools": list(allowed_tools),
+        "approval_required_tools": [],
+    }
 
 
 def test_find_live_compression_child_returns_unique_direct_child(db: SessionDB) -> None:
@@ -277,6 +288,196 @@ def test_publish_compression_child_exposes_complete_child(db: SessionDB) -> None
     assert child["id"] == "atomic-child"
     assert child["system_prompt"] == "compressed system"
     assert [m["content"] for m in db.get_messages("atomic-child")] == ["summary"]
+
+
+def test_publish_compression_child_inherits_exact_model_tool_policy(db: SessionDB) -> None:
+    policy = _model_tool_policy("read_file", "search_files")
+    db.create_session(
+        "policy-parent", source="webui", model_tool_policy=policy,
+        model_tool_policy_version=MODEL_TOOL_POLICY_VERSION,
+    )
+    assert db.try_acquire_compression_lock("policy-parent", "winner", ttl_seconds=60)
+    parent_before = db.get_session("policy-parent")
+
+    db.publish_compression_child(
+        parent_session_id="policy-parent",
+        child_session_id="policy-child",
+        source="webui",
+        messages=[{"role": "user", "content": "summary"}],
+        compression_lock_holder="winner",
+    )
+
+    child = db.get_session("policy-child")
+    assert child["model_tool_policy_version"] == parent_before["model_tool_policy_version"]
+    assert child["model_tool_policy"] == parent_before["model_tool_policy"]
+    assert json.loads(child["model_tool_policy"]) == policy
+
+
+def test_publish_compression_child_preserves_legacy_policy_absence(db: SessionDB) -> None:
+    db.create_session("legacy-parent", source="webui")
+    assert db.try_acquire_compression_lock("legacy-parent", "winner", ttl_seconds=60)
+
+    db.publish_compression_child(
+        parent_session_id="legacy-parent",
+        child_session_id="legacy-child",
+        source="webui",
+        messages=[{"role": "user", "content": "summary"}],
+        compression_lock_holder="winner",
+    )
+
+    child = db.get_session("legacy-child")
+    assert child["model_tool_policy_version"] is None
+    assert child["model_tool_policy"] is None
+
+
+@pytest.mark.parametrize(
+    ("version", "payload"),
+    [
+        (MODEL_TOOL_POLICY_VERSION, "{"),
+        (None, json.dumps(_model_tool_policy("read_file"))),
+        (99, json.dumps(_model_tool_policy("read_file"))),
+    ],
+)
+def test_publish_compression_child_rejects_corrupt_parent_without_state_change(
+    db: SessionDB, version, payload
+) -> None:
+    db.create_session("corrupt-parent", source="webui")
+    db.append_message("corrupt-parent", "user", "original")
+    db._conn.execute(
+        "UPDATE sessions SET model_tool_policy_version = ?, model_tool_policy = ? WHERE id = ?",
+        (version, payload, "corrupt-parent"),
+    )
+    db._conn.commit()
+    parent_before = db.get_session("corrupt-parent")
+    messages_before = db.get_messages("corrupt-parent")
+
+    with pytest.raises(ValueError, match="policy"):
+        db.publish_compression_child(
+            parent_session_id="corrupt-parent",
+            child_session_id="corrupt-child",
+            source="webui",
+            messages=[{"role": "user", "content": "summary"}],
+            require_compression_lease=False,
+        )
+
+    assert db.get_session("corrupt-parent") == parent_before
+    assert db.get_messages("corrupt-parent") == messages_before
+    assert db.get_session("corrupt-child") is None
+
+
+@pytest.mark.parametrize(
+    ("child_version", "child_payload", "error"),
+    [
+        (None, None, "does not match"),
+        (MODEL_TOOL_POLICY_VERSION, "{", "policy"),
+        (MODEL_TOOL_POLICY_VERSION, None, "policy"),
+    ],
+)
+def test_publish_compression_child_rejects_existing_child_policy_mismatch_or_corruption(
+    db: SessionDB, child_version, child_payload, error
+) -> None:
+    policy = _model_tool_policy("read_file")
+    db.create_session(
+        "replay-parent", source="webui", model_tool_policy=policy,
+        model_tool_policy_version=MODEL_TOOL_POLICY_VERSION,
+    )
+    db.append_message("replay-parent", "user", "original")
+    db.create_session("replay-child", source="webui", parent_session_id="replay-parent")
+    db._conn.execute(
+        "UPDATE sessions SET model_tool_policy_version = ?, model_tool_policy = ? WHERE id = ?",
+        (child_version, child_payload, "replay-child"),
+    )
+    db._conn.commit()
+    parent_before = db.get_session("replay-parent")
+    child_before = db.get_session("replay-child")
+
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        db.publish_compression_child(
+            parent_session_id="replay-parent",
+            child_session_id="replay-child",
+            source="webui",
+            messages=[{"role": "user", "content": "summary"}],
+            require_compression_lease=False,
+        )
+
+    assert db.get_session("replay-parent") == parent_before
+    assert db.get_session("replay-child") == child_before
+    assert db.get_messages("replay-parent")[0]["content"] == "original"
+    assert db.get_messages("replay-child") == []
+
+
+def test_publish_compression_child_replay_requires_exact_policy_carrier(db: SessionDB) -> None:
+    policy = _model_tool_policy("read_file")
+    db.create_session(
+        "replay-parent", source="webui", model_tool_policy=policy,
+        model_tool_policy_version=MODEL_TOOL_POLICY_VERSION,
+    )
+    db.create_session(
+        "replay-child", source="webui", parent_session_id="replay-parent",
+        model_tool_policy=policy, model_tool_policy_version=MODEL_TOOL_POLICY_VERSION,
+    )
+    parent_before = db.get_session("replay-parent")
+    child_before = db.get_session("replay-child")
+
+    with pytest.raises(RuntimeError, match="already exists"):
+        db.publish_compression_child(
+            parent_session_id="replay-parent",
+            child_session_id="replay-child",
+            source="webui",
+            messages=[{"role": "user", "content": "summary"}],
+            require_compression_lease=False,
+        )
+
+    assert db.get_session("replay-parent") == parent_before
+    assert db.get_session("replay-child") == child_before
+    assert db.get_messages("replay-child") == []
+
+
+@pytest.mark.parametrize(
+    ("child_version", "child_payload"),
+    [
+        (None, None),
+        (MODEL_TOOL_POLICY_VERSION, json.dumps(_model_tool_policy("search_files"))),
+        (MODEL_TOOL_POLICY_VERSION, "{"),
+    ],
+)
+def test_cold_compression_resolution_rejects_nonidentical_policy_carrier(
+    db: SessionDB, child_version, child_payload
+) -> None:
+    policy = _model_tool_policy("read_file")
+    db.create_session(
+        "cold-parent", source="webui", model_tool_policy=policy,
+        model_tool_policy_version=MODEL_TOOL_POLICY_VERSION,
+    )
+    db.append_message("cold-parent", "user", "before compression")
+    db.end_session("cold-parent", "compression")
+    db.create_session("cold-child", source="webui", parent_session_id="cold-parent")
+    db.append_message("cold-child", "user", "continued")
+    db._conn.execute(
+        "UPDATE sessions SET model_tool_policy_version = ?, model_tool_policy = ? WHERE id = ?",
+        (child_version, child_payload, "cold-child"),
+    )
+    db._conn.commit()
+
+    with pytest.raises(ValueError, match="policy"):
+        db.resolve_resume_session_id("cold-parent")
+
+
+@pytest.mark.parametrize("policy", [None, _model_tool_policy("read_file")])
+def test_cold_compression_resolution_accepts_equal_or_legacy_carriers(
+    db: SessionDB, policy
+) -> None:
+    kwargs = ({
+        "model_tool_policy": policy,
+        "model_tool_policy_version": MODEL_TOOL_POLICY_VERSION,
+    } if policy is not None else {})
+    db.create_session("cold-parent", source="webui", **kwargs)
+    db.append_message("cold-parent", "user", "before compression")
+    db.end_session("cold-parent", "compression")
+    db.create_session("cold-child", source="webui", parent_session_id="cold-parent", **kwargs)
+    db.append_message("cold-child", "user", "continued")
+
+    assert db.resolve_resume_session_id("cold-parent") == "cold-child"
 
 
 def test_publish_compression_child_rejects_lost_or_expired_lease(db: SessionDB) -> None:

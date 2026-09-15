@@ -23,7 +23,11 @@ _COOLDOWN_ROW_SQL = (
 
 # One forward step of get_compression_chain: the preferred continuation child of ``?``.
 _CHAIN_STEP_SQL = f"""
-                    SELECT child.id
+                    SELECT child.id,
+                           parent.model_tool_policy_version AS parent_policy_version,
+                           parent.model_tool_policy AS parent_policy,
+                           child.model_tool_policy_version AS child_policy_version,
+                           child.model_tool_policy AS child_policy
                     FROM sessions parent
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.id = ?
@@ -47,6 +51,16 @@ _CHAIN_STEP_SQL = f"""
 def _cooldown_row(exists: bool, cooldown_until, error) -> Dict[str, Any]:
     return {"session_exists": exists,
             "cooldown_until": float(cooldown_until) if cooldown_until is not None else None, "error": error}
+
+
+def _require_compression_policy_continuity(parent, child) -> None:
+    from agent.model_tool_policy import require_matching_model_tool_policy_carriers
+
+    require_matching_model_tool_policy_carriers(
+        parent["model_tool_policy_version"], parent["model_tool_policy"],
+        child["model_tool_policy_version"], child["model_tool_policy"],
+        context="compression continuation",
+    )
 
 
 def _claim_lease_row(conn, table: str, key_col: str, key: str, holder: str, now: float, expires_at: float,
@@ -119,7 +133,11 @@ class SessionCompressionMixin:
         if not parent_session_id:
             return None
         with self._read_ctx() as conn:
-            if not _ended_by_compression(conn.execute(_ENDED_ROW_SQL, (parent_session_id,)).fetchone()):
+            parent = conn.execute(
+                "SELECT ended_at, end_reason, model_tool_policy_version, model_tool_policy "
+                "FROM sessions WHERE id = ?", (parent_session_id,),
+            ).fetchone()
+            if not _ended_by_compression(parent):
                 return None
             rows = conn.execute(
                 """
@@ -138,7 +156,10 @@ class SessionCompressionMixin:
                 """,
                 (parent_session_id, parent_session_id, parent_session_id),
             ).fetchall()
-        return self._session_row_dict(rows[0]) if len(rows) == 1 else None
+        if len(rows) != 1:
+            return None
+        _require_compression_policy_continuity(parent, rows[0])
+        return self._session_row_dict(rows[0])
 
     def reopen_orphaned_compression_session(self, session_id: str) -> bool:
         """Reopen a compression parent only when no continuation was published (older
@@ -198,7 +219,8 @@ class SessionCompressionMixin:
         return bool(self._execute_write(_do))
 
     def _publish_child_session_row(self, conn, parent, *, parent_session_id, child_session_id, source,
-                                   model, model_config, system_prompt, cwd, profile_name) -> None:
+                                   model, model_config, system_prompt, cwd, profile_name,
+                                   model_tool_policy_version, model_tool_policy) -> None:
         """INSERT the compression child's ``sessions`` row copied from *parent*. Same contract as
         _insert_session_row's compression-fork backfill: the child stays on the parent's profile and keeps
         gateway routing/origin columns; no owner on either side -> this store's profile."""
@@ -209,15 +231,17 @@ class SessionCompressionMixin:
                    system_prompt_hash,
                    parent_session_id, cwd, git_branch, git_repo_root,
                    profile_name, user_id, session_key, chat_id, chat_type,
-                   thread_id, display_name, origin_json, started_at
-                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   thread_id, display_name, origin_json,
+                   model_tool_policy_version, model_tool_policy, started_at
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 child_session_id, source, model, json.dumps(model_config) if model_config else None,
                 system_prompt_hash, parent_session_id, cwd or parent["cwd"], parent["git_branch"],
                 parent["git_repo_root"],
                 profile_name or parent["profile_name"] or self._own_profile_name(),
                 parent["user_id"], parent["session_key"], parent["chat_id"], parent["chat_type"],
-                parent["thread_id"], parent["display_name"], parent["origin_json"], time.time()),
+                parent["thread_id"], parent["display_name"], parent["origin_json"],
+                model_tool_policy_version, model_tool_policy, time.time()),
         )
 
     def publish_compression_child(
@@ -241,6 +265,11 @@ class SessionCompressionMixin:
         ``None`` = unbounded (no internal flush happened). See #47202.
         """
         from hermes_state_errors import CompressionSessionBusyError
+        from agent.model_tool_policy import (
+            decode_stored_model_tool_policy,
+            encode_model_tool_policy,
+            require_matching_model_tool_policy_carriers,
+        )
         def _do(conn):
             if require_lease_refresh and compression_lock_holder:
                 conn.execute(
@@ -254,15 +283,33 @@ class SessionCompressionMixin:
             ):
                 raise CompressionSessionBusyError(
                     f"Compression lease lost before publication: {parent_session_id}")
+
             parent = conn.execute(
                 """SELECT ended_at, end_reason, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
-                          thread_id, display_name, origin_json, profile_name
+                          thread_id, display_name, origin_json, profile_name,
+                          model_tool_policy_version, model_tool_policy
                    FROM sessions WHERE id = ?""",
                 (parent_session_id,),
             ).fetchone()
             if parent is None:
                 raise RuntimeError(f"Compression parent not found: {parent_session_id}")
+            parent_policy = decode_stored_model_tool_policy(
+                parent["model_tool_policy_version"], parent["model_tool_policy"])
+            policy_version = parent["model_tool_policy_version"]
+            policy_payload = encode_model_tool_policy(parent_policy) if parent_policy is not None else None
+
+            existing_child = conn.execute(
+                "SELECT model_tool_policy_version, model_tool_policy FROM sessions WHERE id = ?",
+                (child_session_id,),
+            ).fetchone()
+            if existing_child is not None:
+                require_matching_model_tool_policy_carriers(
+                    parent["model_tool_policy_version"], parent["model_tool_policy"],
+                    existing_child["model_tool_policy_version"], existing_child["model_tool_policy"],
+                    context="compression child",
+                )
+                raise RuntimeError(f"Compression child already exists: {child_session_id}")
             if parent["ended_at"] is not None:
                 # An AUTOMATIC end stamp (tui_shutdown, ws_disconnect, orphan reap, idle/LRU
                 # evict) is stale by construction — this lease holder is still continuing the
@@ -278,7 +325,8 @@ class SessionCompressionMixin:
             self._publish_child_session_row(
                 conn, parent, parent_session_id=parent_session_id, child_session_id=child_session_id,
                 source=source, model=model, model_config=model_config, system_prompt=system_prompt,
-                cwd=cwd, profile_name=profile_name)
+                cwd=cwd, profile_name=profile_name,
+                model_tool_policy_version=policy_version, model_tool_policy=policy_payload)
             total_messages, total_tool_calls = self._insert_message_rows(conn, child_session_id, messages)
             if watermark is not None:
                 # Clone the parent's concurrent tail into the child after the handoff;
@@ -657,6 +705,13 @@ class SessionCompressionMixin:
         for _ in range(100):  # defensive bound; chains this deep are pathological
             with self._read_ctx() as conn:
                 row = conn.execute(_CHAIN_STEP_SQL, (current,)).fetchone()
+            if row is not None:
+                from agent.model_tool_policy import require_matching_model_tool_policy_carriers
+                require_matching_model_tool_policy_carriers(
+                    row["parent_policy_version"], row["parent_policy"],
+                    row["child_policy_version"], row["child_policy"],
+                    context="compression continuation",
+                )
             child_id = row["id"] if row is not None else None
             if not child_id or child_id in seen:
                 return chain
@@ -676,7 +731,10 @@ class SessionCompressionMixin:
         if not parent_id or self._is_explicit_fork_child_row(child):
             return False
         parent = self.get_session(parent_id)
-        return bool(parent and parent.get("end_reason") == "compression")
+        if not parent or parent.get("end_reason") != "compression":
+            return False
+        _require_compression_policy_continuity(parent, child)
+        return True
 
     def get_compression_lineage(self, session_id: str) -> List[str]:
         """Return compression ancestors through tip in chronological order."""

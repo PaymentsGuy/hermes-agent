@@ -900,8 +900,17 @@ def _deferred_build_agent_kwargs(current: dict, session_db) -> dict:
     stored conversation id so the upgrade continues it; a cold deferred resume restores the full persisted
     runtime identity (like the eager resume's overrides splat) so the build can't drop the provider. No
     stored runtime, or an unroutable provider → this session's picked model/effort/tier, else the default."""
+    has_policy_carrier = (
+        current.get("model_tool_policy") is not None
+        or current.get("model_tool_policy_version") is not None
+    )
+    policy_db = (
+        session_db if session_db is not None else _get_db()
+    ) if has_policy_carrier else None
+    policy = _validated_session_model_tool_policy(current, policy_db)
     kw = {"session_db": session_db, "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(current),
-          "platform_override": _session_source(current)}
+          "platform_override": _session_source(current),
+          "model_tool_policy": policy}
     if resume_sid := current.get("resume_session_id"):
         kw["session_id"] = resume_sid
     resume_overrides = current.get("resume_runtime_overrides")
@@ -2077,6 +2086,11 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "profile_name": profile_name_for_home(sess.get("profile_home")) or _current_profile_name(),
     }
     with contextlib.suppress(Exception):
+        from agent.model_tool_policy import model_tool_policy_identity
+        identity = model_tool_policy_identity(sess.get("model_tool_policy"))
+        if identity is not None:
+            info["model_tool_policy"] = identity
+    with contextlib.suppress(Exception):
         from hermes_cli import __version__, __release_date__
         info.update(version=__version__, release_date=__release_date__)
     live_agent = agent is not None and not sess.get("_compute_host_active")
@@ -2263,7 +2277,8 @@ def _make_agent(
     sid: str, key: str, session_id: str | None = None, session_db=None,
     model_override: dict | str | None = None, provider_override: str | None = None,
     reasoning_config_override: dict | None = None, service_tier_override: str | None = None,
-    platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None):
+    platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None,
+    model_tool_policy: dict | None = None):
     # AC-4 test seam: dead unless armed by the isolated certify harness.
     from tui_gateway.synthetic_turn import maybe_build_synthetic_agent
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
@@ -2302,6 +2317,7 @@ def _make_agent(
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
+        model_tool_policy=model_tool_policy,
         **_agent_cbs(sid))
     if context_cwd_is_launch_artifact is None:
         with _sessions_lock:
@@ -2345,7 +2361,12 @@ def _hydrate_session_cwd(sid: str, key: str, session_db, profile_home: str | Non
 def _init_session(
     sid: str, key: str, agent, history: list, cols: int = 80, cwd: str | None = None,
     session_db=None, source: str | None = None, profile_home: str | None = None,
-    explicit_cwd: bool = False):
+    explicit_cwd: bool = False, model_tool_policy: dict | None = None,
+    model_tool_policy_version: int | None = None):
+    from agent.model_tool_policy import MODEL_TOOL_POLICY_VERSION
+
+    if model_tool_policy is not None and model_tool_policy_version is None:
+        model_tool_policy_version = MODEL_TOOL_POLICY_VERSION
     now = time.time()
     with _sessions_lock:
         _sessions[sid] = {
@@ -2359,6 +2380,8 @@ def _init_session(
             "profile_home": profile_home,
             # In-session /model switch, honored on rebuild (/new, resume) — never leaks to siblings via env vars.
             "model_override": None,
+            "model_tool_policy": model_tool_policy,
+            "model_tool_policy_version": model_tool_policy_version,
             # Async events go to the transport that created the session (stdio for Ink, WS for the dashboard).
             "transport": current_transport() or _stdio_transport,
         }
@@ -2408,8 +2431,10 @@ def _deferred_session_record(
     close_on_disconnect: bool = False, display_history_prefix: list | None = None,
     profile_home: Path | None = None, lazy: bool = False, model_override=None,
     resume_runtime_overrides: dict | None = None, todo_state: dict | None = None,
-    explicit_cwd: bool = False) -> dict:
+    explicit_cwd: bool = False, model_tool_policy: dict | None = None) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold resume) — _init_session's shape minus the agent."""
+    from agent.model_tool_policy import MODEL_TOOL_POLICY_VERSION
+
     now = time.time()
     return {
         "agent": None, "agent_error": None, "agent_ready": threading.Event(), "attached_images": [],
@@ -2418,6 +2443,9 @@ def _deferred_session_record(
         "edit_snapshots": {}, "explicit_cwd": bool(explicit_cwd), "history": history,
         "history_lock": threading.Lock(), "history_version": 0, "image_counter": 0,
         "inflight_turn": None, "last_active": now, "lazy": lazy, "model_override": model_override,
+        "model_tool_policy": model_tool_policy,
+        "model_tool_policy_version": (
+            MODEL_TOOL_POLICY_VERSION if model_tool_policy is not None else None),
         "pending_title": None,
         "profile_home": str(profile_home) if profile_home is not None else None,
         "resume_runtime_overrides": resume_runtime_overrides, "resume_session_id": session_key,

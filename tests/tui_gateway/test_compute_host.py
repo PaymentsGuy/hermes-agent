@@ -5,6 +5,24 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from agent.model_tool_policy import MODEL_TOOL_POLICY_VERSION
+from hermes_state import SessionDB
+from tui_gateway import server
+from tui_gateway.compute_host import ComputeHost
+
+
+POLICY_SHA = "f" * 64
+
+
+def _policy(*allowed):
+    return {
+        "policy_id": "compute-policy", "policy_sha256": POLICY_SHA,
+        "allowed_tools": list(allowed), "approval_required_tools": [],
+    }
 
 
 def _stdout_queue(proc: subprocess.Popen) -> queue.Queue[dict]:
@@ -60,3 +78,72 @@ def test_compute_host_line_json_hello_and_shutdown():
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+def test_compute_host_frame_and_host_agent_keep_full_policy_and_marker(tmp_path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    policy = _policy("read_file")
+    db.create_session(
+        "compute-key", "desktop", model_tool_policy=policy,
+        model_tool_policy_version=MODEL_TOOL_POLICY_VERSION,
+    )
+    parent = {
+        "agent": SimpleNamespace(_session_db=db), "session_key": "compute-key",
+        "source": "desktop", "model_tool_policy": policy,
+        "model_tool_policy_version": MODEL_TOOL_POLICY_VERSION,
+        "history": [], "history_lock": threading.Lock(), "history_version": 0,
+        "cwd": str(tmp_path), "cols": 80,
+    }
+    frame = server._compute_host_turn_frame("rid", "compute-sid", parent, "hello")
+    assert frame["model_tool_policy"] == policy
+    assert frame["model_tool_policy_version"] == MODEL_TOOL_POLICY_VERSION
+
+    captured = {}
+    fake_agent = SimpleNamespace(_session_db=None, _owns_session_db=False)
+    monkeypatch.setattr(server, "_create_model_tool_policy", lambda params, **_kwargs: params["model_tool_policy"])
+    monkeypatch.setattr(server, "_make_agent", lambda *_args, **kwargs: captured.update(kwargs) or fake_agent)
+
+    def init_session(sid, key, agent, history, **kwargs):
+        captured["init"] = kwargs
+        server._sessions[sid] = {
+            "agent": agent, "session_key": key, "history": history,
+            "history_lock": threading.Lock(), "source": "desktop",
+        }
+
+    monkeypatch.setattr(server, "_init_session", init_session)
+    sink = open(os.devnull, "w")
+    host = ComputeHost(stdout=sink, heartbeat_secs=0)
+    try:
+        child = host._build_server_session(server, frame, "compute-sid")
+    finally:
+        host.close()
+        sink.close()
+        server._sessions.pop("compute-sid", None)
+        db.close()
+
+    assert captured["model_tool_policy"] == policy
+    assert captured["init"]["model_tool_policy"] == policy
+    assert captured["init"]["model_tool_policy_version"] == MODEL_TOOL_POLICY_VERSION
+    assert child["model_tool_policy"] == policy
+    assert child["model_tool_policy_version"] == MODEL_TOOL_POLICY_VERSION
+
+
+def test_compute_host_rejects_policy_payload_without_marker_before_agent_build(monkeypatch):
+    built = []
+    monkeypatch.setattr(server, "_make_agent", lambda *_a, **_k: built.append(True))
+    frame = {
+        "type": "turn.start", "sid": "corrupt-compute", "session_key": "key",
+        "source": "desktop", "model_tool_policy": _policy("read_file"),
+        "history": [], "cwd": "", "cols": 80,
+    }
+    sink = open(os.devnull, "w")
+    host = ComputeHost(stdout=sink, heartbeat_secs=0)
+    try:
+        with pytest.raises(ValueError, match="marker or payload"):
+            host._build_server_session(server, frame, "corrupt-compute")
+    finally:
+        host.close()
+        sink.close()
+        server._sessions.pop("corrupt-compute", None)
+
+    assert built == []

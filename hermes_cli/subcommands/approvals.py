@@ -67,4 +67,20 @@ def build_approvals_parser(subparsers, *, cmd_approvals: Callable) -> None:
         help="The command to evaluate (prefix with -- to protect its flags)")
     test_parser.set_defaults(func=cmd_approvals)
 
+    receipt_parser = approvals_subparsers.add_parser(
+        "verify-receipt",
+        help="Atomically verify and consume an approved receipt",
+        description="Verify an unexpired approved receipt against exact active-profile, "
+        "session, tool, and scope bindings, then atomically consume it.",
+    )
+    receipt_parser.add_argument("--id", dest="receipt_id", required=True)
+    receipt_parser.add_argument("--session", dest="session_id", required=True)
+    receipt_parser.add_argument("--tool", dest="tool_name", required=True)
+    receipt_parser.add_argument(
+        "--scope-sha256", dest="approval_scope_sha256", required=True,
+    )
+    receipt_parser.add_argument("--consume-id", dest="consume_id", required=True)
+    add_json_flag(receipt_parser, "Emit the bounded receipt result as JSON")
+    receipt_parser.set_defaults(func=cmd_approvals)
+
     approvals_parser.set_defaults(func=cmd_approvals)

@@ -2,8 +2,12 @@
 file-serving helpers shared with the local-skill path. Helpers tests patch on the origin module
 (``_is_skill_disabled``, ``_parse_frontmatter``, ``skill_matches_platform``) resolve lazily."""
 
+import hashlib
+import io
 import json
 import logging
+import os
+import stat
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, List
@@ -34,6 +38,73 @@ def _read_skill_text(path: Path) -> str:
     """utf-8-sig + errors="replace": user-authored SKILL.md may carry a Notepad BOM or stray
     bytes; pinning UTF-8 keeps skill_view deterministic across host locales."""
     return path.read_text(encoding="utf-8-sig", errors="replace")
+
+
+def _decode_skill_bytes(data: bytes) -> str:
+    """Decode one snapshot like ``Path.read_text`` (BOM stripping + universal newlines)."""
+    with io.TextIOWrapper(
+        io.BytesIO(data), encoding="utf-8-sig", errors="replace"
+    ) as handle:
+        return handle.read()
+
+
+def _read_authorized_file_bytes(target: Path, root: Path) -> bytes:
+    """Open one contained regular file once and return its authorized byte snapshot.
+
+    The pre/post identity checks close replacement races around pathname resolution.  POSIX
+    ``O_NOFOLLOW`` also refuses a final symlink; platforms without it still fail closed when
+    the opened descriptor does not match the resolved in-root object.
+    """
+    canonical_root = root.resolve(strict=True)
+    canonical_target = target.resolve(strict=True)
+    canonical_target.relative_to(canonical_root)
+    expected = canonical_target.stat()
+    if not stat.S_ISREG(expected.st_mode):
+        raise IsADirectoryError(f"not a regular file: {target}")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(target, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise IsADirectoryError(f"not a regular file: {target}")
+        if not os.path.samestat(expected, opened):
+            raise OSError(f"File changed while being opened: {target}")
+
+        current_target = target.resolve(strict=True)
+        current_target.relative_to(canonical_root)
+        if not os.path.samestat(current_target.stat(), opened):
+            raise OSError(f"File changed while being opened: {target}")
+
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            return handle.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _raw_file_fields(
+    data: bytes, relative_path: str, *, raw_identity: bool, raw_text: bool
+) -> tuple[dict, str | None]:
+    """Build optional raw fields from the same bytes used for ordinary rendering."""
+    if not raw_identity:
+        return {}, None
+    fields = {
+        "raw_files": [{
+            "path": relative_path,
+            "byte_length": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "state": "present",
+        }]
+    }
+    if raw_text:
+        try:
+            fields["raw_text"] = data.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return {}, f"File '{relative_path}' is not valid UTF-8; raw_text was not returned."
+    return fields, None
 
 
 def _truncate_description(description: str) -> str:
@@ -67,7 +138,8 @@ def _available_skill_files(skill_dir: Path) -> Dict[str, List[str]]:
 
 def _serve_skill_file(
     skill_root: Path, file_path: str, label: str, *, hint: str | None = None,
-    list_available: bool = False, read_error_prefix: bool = False, mark_read: bool = False) -> str:
+    list_available: bool = False, read_error_prefix: bool = False, mark_read: bool = False,
+    raw_identity: bool = False, raw_text: bool = False) -> str:
     """Serve one linked file from a skill directory as a skill_view JSON result. ``hint``
     decorates traversal/containment errors; ``list_available`` adds the available-files listing
     on not-found (local); ``read_error_prefix`` wraps non-decode read errors (plugin) instead
@@ -79,27 +151,29 @@ def _serve_skill_file(
     target = skill_root / file_path
     if path_error := validate_within_dir(target, skill_root):
         return _fail(path_error, **extra)
-    # is_file(), not exists(): a bare directory must take the not-found branch.
-    if not target.is_file():
+    try:
+        data = _read_authorized_file_bytes(target, skill_root)
+    except (FileNotFoundError, IsADirectoryError):
         listing = {} if not list_available else {
             "available_files": _available_skill_files(skill_root),
             "hint": "Use one of the available file paths listed above"}
         return _fail(f"File '{file_path}' not found in skill '{label}'.", **listing)
-    try:
-        content = _read_skill_text(target)
-    except UnicodeDecodeError:
-        return _json({
-            "success": True, "name": label, "file": file_path, "is_binary": True,
-            "content": f"[Binary file: {target.name}, size: {target.stat().st_size} bytes]"})
     except Exception as exc:
         if not read_error_prefix:
             raise
         return _fail(f"Failed to read '{file_path}': {exc}")
+    normalized_path = target.relative_to(skill_root).as_posix()
+    raw_fields, raw_error = _raw_file_fields(
+        data, normalized_path, raw_identity=raw_identity, raw_text=raw_text
+    )
+    if raw_error:
+        return _fail(raw_error)
+    content = _decode_skill_bytes(data)
     if mark_read:
         _mark_background_review_read(target)
     return _json({  # _source_path: internal, feeds the repeat-view dedup fingerprint
         "success": True, "name": label, "file": file_path, "content": content,
-        "file_type": target.suffix, "_source_path": str(target)})
+        "file_type": target.suffix, "_source_path": str(target), **raw_fields})
 
 
 def _mark_background_review_read(path: Path) -> None:
@@ -122,7 +196,8 @@ def _preprocess_skill(content: str, skill_dir, session_id, debug_msg: str, *args
 
 def _serve_plugin_skill(
     skill_md: Path, namespace: str, bare: str, file_path: str | None = None, *,
-    preprocess: bool = True, session_id: str | None = None) -> str:
+    preprocess: bool = True, session_id: str | None = None,
+    raw_identity: bool = False, raw_text: bool = False) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
     from tools import skills_tool as _st
@@ -130,9 +205,10 @@ def _serve_plugin_skill(
         return _fail(f"Plugin '{namespace}' is disabled. Re-enable with: hermes plugins enable {namespace}")
     qualified_name = f"{namespace}:{bare}"
     try:
-        content = _read_skill_text(skill_md)
+        data = _read_authorized_file_bytes(skill_md, skill_md.parent)
     except Exception as e:
         return _fail(f"Failed to read skill '{qualified_name}': {e}")
+    content = _decode_skill_bytes(data)
     parsed_frontmatter = _safe_frontmatter(content=content)
     if _st._is_skill_disabled(qualified_name):
         return _fail(f"Skill '{qualified_name}' is disabled.")
@@ -140,7 +216,9 @@ def _serve_plugin_skill(
         return _fail(f"Skill '{qualified_name}' is not supported on this platform.",
                      readiness_status=SkillReadinessStatus.UNSUPPORTED.value)
     if file_path:
-        return _serve_skill_file(skill_md.parent, file_path, qualified_name, read_error_prefix=True)
+        return _serve_skill_file(
+            skill_md.parent, file_path, qualified_name, read_error_prefix=True,
+            raw_identity=raw_identity, raw_text=raw_text)
     if any(p in content.lower() for p in _INJECTION_PATTERNS):
         logger.warning(
             "Plugin skill '%s:%s' contains patterns that may indicate prompt injection", namespace, bare)
@@ -153,11 +231,16 @@ def _serve_plugin_skill(
     rendered_content = content if not preprocess else _preprocess_skill(
         content, skill_md.parent, session_id, "Could not preprocess plugin skill %s:%s",
         namespace, bare)
+    raw_fields, raw_error = _raw_file_fields(
+        data, "SKILL.md", raw_identity=raw_identity, raw_text=raw_text
+    )
+    if raw_error:
+        return _fail(raw_error)
     return _json({
         "success": True, "name": qualified_name, "content": banner + rendered_content,
         "description": _truncate_description(str(parsed_frontmatter.get("description", ""))),
         "linked_files": _plugin_skill_linked_files(skill_md.parent),
-        "readiness_status": SkillReadinessStatus.AVAILABLE.value})
+        "readiness_status": SkillReadinessStatus.AVAILABLE.value, **raw_fields})
 
 
 def _plugin_skill_linked_files(skill_root: Path) -> Dict[str, List[str]] | None:

@@ -76,6 +76,133 @@ def agent():
         return a
 
 
+@pytest.mark.parametrize("executor_name", ["sequential", "concurrent"])
+def test_proposal_whitelist_blocks_mutation_tools_in_real_workers(agent, executor_name):
+    """Proposal review policy reaches both tool-worker implementations before handlers."""
+    from agent.inline_tool_executors import INLINE_TOOL_EXECUTORS
+    from hermes_cli.plugins import clear_thread_tool_whitelist, set_thread_tool_whitelist
+
+    calls = [
+        _mock_tool_call(name=name, arguments="{}", call_id=f"blocked-{name}")
+        for name in ("memory", "skill_manage", "terminal")
+    ]
+    assistant = _mock_assistant_msg(content="", tool_calls=calls)
+    messages = []
+    memory_handler = MagicMock(return_value='{"unexpected": "memory"}')
+    registry_handler = MagicMock(return_value='{"unexpected": "registry"}')
+    concurrent_handler = MagicMock(return_value='{"unexpected": "concurrent"}')
+    agent._invoke_tool = concurrent_handler
+
+    set_thread_tool_whitelist(
+        {"propose_shared_memory", "read_file"},
+        deny_msg_fmt="Proposal review denied {tool_name}",
+    )
+    try:
+        with patch.dict(INLINE_TOOL_EXECUTORS, {"memory": memory_handler}), patch(
+            "model_tools.handle_function_call", registry_handler
+        ):
+            if executor_name == "sequential":
+                agent._execute_tool_calls_sequential(assistant, messages, "review-task")
+            else:
+                agent._execute_tool_calls_concurrent(assistant, messages, "review-task")
+    finally:
+        clear_thread_tool_whitelist()
+
+    memory_handler.assert_not_called()
+    registry_handler.assert_not_called()
+    concurrent_handler.assert_not_called()
+    assert len(messages) == 3
+    assert all("Proposal review denied" in message["content"] for message in messages)
+
+
+@pytest.mark.parametrize(
+    ("executor_name", "tool_name"),
+    [("sequential", "propose_shared_memory"), ("concurrent", "read_file")],
+)
+def test_proposal_whitelist_allows_proposal_and_read_tools_in_real_workers(
+    agent, executor_name, tool_name
+):
+    """Propagation does not turn the proposal whitelist into a deny-all policy."""
+    from hermes_cli.plugins import clear_thread_tool_whitelist, set_thread_tool_whitelist
+
+    assistant = _mock_assistant_msg(
+        content="", tool_calls=[_mock_tool_call(name=tool_name, arguments="{}", call_id="allowed")]
+    )
+    messages = []
+    registry_handler = MagicMock(return_value='{"success": true}')
+    concurrent_handler = MagicMock(return_value='{"success": true}')
+    agent._invoke_tool = concurrent_handler
+
+    set_thread_tool_whitelist({"propose_shared_memory", "read_file"})
+    try:
+        with patch("model_tools.handle_function_call", registry_handler):
+            if executor_name == "sequential":
+                agent._execute_tool_calls_sequential(assistant, messages, "review-task")
+                registry_handler.assert_called_once()
+                concurrent_handler.assert_not_called()
+            else:
+                agent._execute_tool_calls_concurrent(assistant, messages, "review-task")
+                concurrent_handler.assert_called_once()
+                registry_handler.assert_not_called()
+    finally:
+        clear_thread_tool_whitelist()
+
+    assert len(messages) == 1
+    assert json.loads(messages[0]["content"])["success"] is True
+
+
+def test_proposal_whitelist_isolated_across_reviews_and_cleared_after_workers(agent):
+    """Nested workers inherit only their submitting review's policy, then discard it."""
+    from hermes_cli.plugins import (
+        clear_thread_tool_whitelist,
+        get_pre_tool_call_block_message,
+        set_thread_tool_whitelist,
+    )
+
+    barrier = threading.Barrier(2)
+    handler_calls = []
+    post_clear = []
+
+    def registry_handler(name, args, task_id, **kwargs):
+        handler_calls.append((args["review"], name))
+        return '{"success": true}'
+
+    def run_review(review, allowed, other):
+        set_thread_tool_whitelist({allowed})
+        try:
+            barrier.wait(timeout=5)
+            assistant = _mock_assistant_msg(
+                content="",
+                tool_calls=[
+                    _mock_tool_call(
+                        name=name,
+                        arguments=json.dumps({"review": review}),
+                        call_id=f"{review}-{name}",
+                    )
+                    for name in (allowed, other)
+                ],
+            )
+            agent._execute_tool_calls_sequential(assistant, [], f"review-{review}")
+        finally:
+            clear_thread_tool_whitelist()
+        post_clear.append(get_pre_tool_call_block_message("terminal", {}))
+
+    with patch("model_tools.handle_function_call", side_effect=registry_handler):
+        threads = [
+            threading.Thread(target=run_review, args=("a", "proposal_a", "proposal_b")),
+            threading.Thread(target=run_review, args=("b", "proposal_b", "proposal_a")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+    assert sorted(handler_calls) == [("a", "proposal_a"), ("b", "proposal_b")]
+    assert post_clear == [None, None]
+    assert get_pre_tool_call_block_message("terminal", {}) is None
+
+
 def test_persist_user_message_override_rewrites_text_turns(agent):
     messages = [{"role": "user", "content": "API-only synthetic prefix\nhello"}]
     agent._persist_user_message_idx = 0
@@ -2160,6 +2287,8 @@ class TestConcurrentToolExecution:
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
                 tool_request_middleware_trace=[],
+                call_origin="model",
+                model_tool_policy=None,
             )
             assert result == "result"
 

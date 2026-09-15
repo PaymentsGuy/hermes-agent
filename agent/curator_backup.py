@@ -24,6 +24,7 @@ from hermes_constants import get_hermes_home
 from agent.skill_utils import is_excluded_skill_path
 from agent.curator import _read_config_section
 from hermes_cli.sizefmt import format_bytes
+from tools.skill_mutation_lock import skill_mutation_lock
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ DEFAULT_KEEP = 5
 # with the full history (once backups are committed back, each snapshot contains the prior ones: 38MB of skills inflated to 24GB
 # in weeks). The tar filter in ``snapshot_skills`` applies the same set to nested paths, so a nested ``.git`` is skipped too.
 # See #91449.
-_EXCLUDE_TOP_LEVEL = {".curator_backups", ".hub", ".git"}
+_EXCLUDE_TOP_LEVEL = {".curator_backups", ".hub", ".git", ".mutation.lock"}
 
 # Snapshot id: UTC ISO with colons replaced by dashes (Windows-safe filename); optional ``-NN`` suffix for same-second snapshots.
 _ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z(-\d{2})?$")
@@ -355,7 +356,7 @@ def _cron_summary(cron_report: Dict[str, Any]) -> Optional[str]:
     return "cron links: " + ", ".join(parts) if parts else None
 
 
-def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]]:
+def _rollback_unlocked(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]]:
     """Restore ``~/.hermes/skills/`` from a snapshot (explicit id or newest): safety-snapshot the CURRENT tree; stage
     current top-level entries; extract; on failure move staged entries back. Returns ``(ok, message, snapshot_path)``."""
     target = _resolve_backup(backup_id)
@@ -428,6 +429,12 @@ def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]
     cron_report = _restore_cron_skill_links(target)
     logger.info("Curator rollback: restored from %s (cron_report=%s)", target.name, cron_report)
     return (True, "; ".join(filter(None, [f"restored from snapshot {target.name}", _cron_summary(cron_report)])), target)
+
+
+def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]]:
+    """Restore a snapshot as one profile-wide skill mutation transaction."""
+    with skill_mutation_lock():
+        return _rollback_unlocked(backup_id)
 
 
 # --- Human-readable summary for CLI ---

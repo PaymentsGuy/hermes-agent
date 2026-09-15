@@ -704,6 +704,32 @@ def _run_agent_tool_execution_middleware(
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    from agent.model_tool_policy import model_tool_policy_denial
+    if denial := model_tool_policy_denial(
+        function_name, call_origin="model", policy=getattr(agent, "model_tool_policy", None),
+    ):
+        return _ManagedToolResult(
+            result=json.dumps({"error": denial}, ensure_ascii=False), args=function_args,
+            middleware_trace=list(middleware_trace or []), blocked=True, dispatched=False,
+        )
+    try:
+        import model_tools
+        entry = model_tools.registry.get_entry(function_name)
+        intrinsic = bool(entry and entry.human_approval == "always")
+    except Exception:
+        intrinsic = False
+    if intrinsic:
+        if scope_block is not None:
+            if begin_execution is not None:
+                begin_execution()
+            return _ManagedToolResult(
+                result=json.dumps({"error": scope_block}, ensure_ascii=False), args=function_args,
+                middleware_trace=list(middleware_trace or []), blocked=True, dispatched=False,
+            )
+        return _ManagedToolResult(
+            result=execute(function_args), args=function_args,
+            middleware_trace=list(middleware_trace or []), blocked=False, dispatched=True,
+        )
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
@@ -1531,6 +1557,8 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     def _execute(next_args: dict) -> Any:
         import model_tools
 
+        entry = model_tools.registry.get_entry(function_name)
+        intrinsic = bool(entry and entry.human_approval == "always")
         with model_tools.suppress_post_tool_call_hook():
             return model_tools.handle_function_call(
                 function_name,
@@ -1541,12 +1569,13 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                skip_pre_tool_call_hook=True,
-                skip_tool_request_middleware=True,
-                skip_tool_execution_middleware=True,
+                skip_pre_tool_call_hook=not intrinsic,
+                skip_tool_request_middleware=not intrinsic,
+                skip_tool_execution_middleware=not intrinsic,
                 tool_request_middleware_trace=list(middleware_trace),
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                call_origin="model", model_tool_policy=getattr(agent, "model_tool_policy", None),
             )
 
     return _SequentialDispatch(

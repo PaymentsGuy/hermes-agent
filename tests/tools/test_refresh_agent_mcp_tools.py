@@ -22,12 +22,22 @@ def _tool(name):
     return {"type": "function", "function": {"name": name, "description": "", "parameters": {}}}
 
 
-def _agent(tool_names, *, enabled=None, disabled=None):
+def _policy(*allowed_tools):
+    return {
+        "policy_id": "test-policy",
+        "policy_sha256": "0" * 64,
+        "allowed_tools": list(allowed_tools),
+        "approval_required_tools": [],
+    }
+
+
+def _agent(tool_names, *, enabled=None, disabled=None, policy=None):
     a = types.SimpleNamespace()
     a.tools = [_tool(n) for n in tool_names]
     a.valid_tool_names = set(tool_names)
     a.enabled_toolsets = enabled
     a.disabled_toolsets = disabled
+    a.model_tool_policy = policy
     return a
 
 
@@ -46,6 +56,80 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert added == {"mcp_granola_get_account_info"}
     assert "mcp_granola_get_account_info" in agent.valid_tool_names
     assert len(agent.tools) == 3
+
+
+def test_refresh_applies_exact_session_model_tool_policy(monkeypatch):
+    agent = _agent(["read_file"], policy=_policy("read_file"))
+    agent.context_compressor = types.SimpleNamespace(
+        get_tool_schemas=lambda: [{"name": "lcm_grep", "description": "", "parameters": {}}]
+    )
+    agent._context_engine_tool_names = set()
+    _serve(monkeypatch, [_tool("read_file"), _tool("terminal")])
+
+    _mcp_agent.refresh_agent_mcp_tools(agent)
+
+    assert [t["function"]["name"] for t in agent.tools] == ["read_file"]
+    assert agent.valid_tool_names == {"read_file"}
+    assert agent._context_engine_tool_names == set()
+
+
+@pytest.mark.parametrize(
+    ("policy", "error"),
+    [
+        (_policy("read_file", "mcp_late_tool"), "declares unavailable tool.*mcp_late_tool"),
+        ({"corrupt": True}, "fields are closed"),
+    ],
+)
+def test_refresh_policy_failure_retains_previous_validated_snapshot(monkeypatch, policy, error):
+    agent = _agent(["read_file"], policy=policy)
+    previous_tools = agent.tools
+    _serve(monkeypatch, [_tool("read_file"), _tool("terminal")])
+
+    with pytest.raises(ValueError, match=error):
+        _mcp_agent.refresh_agent_mcp_tools(agent)
+
+    assert agent.tools is previous_tools
+    assert agent.valid_tool_names == {"read_file"}
+
+
+def test_refresh_legacy_agent_keeps_unrestricted_candidate_order_and_objects(monkeypatch):
+    agent = _agent(["read_file"])
+    candidate = [_tool("terminal"), _tool("read_file")]
+    _serve(monkeypatch, candidate)
+
+    _mcp_agent.refresh_agent_mcp_tools(agent)
+
+    assert agent.tools == candidate
+    assert agent.tools[0] is candidate[0]
+    assert agent.tools[1] is candidate[1]
+    assert agent.valid_tool_names == {"read_file", "terminal"}
+
+
+def test_concurrent_agents_apply_their_own_policy_and_admit_allowed_late_tool(monkeypatch):
+    read_agent = _agent(["read_file"], policy=_policy("read_file"))
+    mcp_agent = _agent(["terminal"], policy=_policy("terminal", "mcp_late_tool"))
+    _serve(monkeypatch, [_tool("read_file"), _tool("terminal"), _tool("mcp_late_tool")])
+
+    errors = []
+
+    def _refresh(agent):
+        try:
+            _mcp_agent.refresh_agent_mcp_tools(agent)
+        except Exception as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_refresh, args=(read_agent,)),
+        threading.Thread(target=_refresh, args=(mcp_agent,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors
+    assert [t["function"]["name"] for t in read_agent.tools] == ["read_file"]
+    assert [t["function"]["name"] for t in mcp_agent.tools] == ["terminal", "mcp_late_tool"]
 
 
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):
@@ -347,6 +431,26 @@ def test_eviction_rebuild_restores_the_sessions_saved_tool_order(monkeypatch):
     assert changed is True
     assert [t["function"]["name"] for t in rebuilt.tools] == saved
     assert rebuilt.valid_tool_names == set(saved)
+
+
+def test_eviction_restore_never_reintroduces_tool_outside_session_policy(monkeypatch):
+    from tools import registry as registry_mod
+
+    entries = {
+        name: types.SimpleNamespace(name=name, schema=_tool(name)["function"])
+        for name in ("read_file", "terminal")
+    }
+    monkeypatch.setattr(registry_mod.registry, "get_all_entries", lambda: list(entries.values()), raising=False)
+    monkeypatch.setattr(registry_mod.registry, "get_entry", lambda name, **kw: entries.get(name), raising=False)
+    rebuilt = _agent(["read_file"], policy=_policy("read_file"))
+    retained_schema = rebuilt.tools[0]
+
+    changed = _mcp_agent.restore_agent_tool_prefix(rebuilt, ["terminal", "read_file"])
+
+    assert changed is False
+    assert rebuilt.tools == [retained_schema]
+    assert rebuilt.tools[0] is retained_schema
+    assert rebuilt.valid_tool_names == {"read_file"}
 
 
 def test_reprobe_tool_availability_drops_cached_check_fn_verdicts(monkeypatch):

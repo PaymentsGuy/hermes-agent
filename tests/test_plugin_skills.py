@@ -6,6 +6,7 @@ Covers:
 - tools/skills_tool qualified name dispatch in skill_view
 """
 
+import hashlib
 import json
 import logging
 
@@ -202,6 +203,71 @@ class TestSkillViewQualifiedName:
         assert result["success"] is True
         assert result["name"] == "superpowers:writing-plans"
         assert "writing-plans body." in result["content"]
+
+    def test_plugin_skill_raw_identity_and_text_use_exact_underlying_bytes(self, tmp_path):
+        from tools.skills_tool import skill_view
+
+        md = self._register_skill(tmp_path)
+        raw_bytes = (
+            "---\r\nname: writing-plans\r\ndescription: exact\r\n---\r\n\r\n"
+            "Plugin \u2603\r\n"
+        ).encode("utf-8")
+        md.write_bytes(raw_bytes)
+
+        result = json.loads(
+            skill_view(
+                "superpowers:writing-plans", raw_identity=True, raw_text=True
+            )
+        )
+
+        assert result["success"] is True
+        assert result["raw_text"].encode("utf-8") == raw_bytes
+        assert result["raw_files"] == [
+            {
+                "path": "SKILL.md",
+                "byte_length": len(raw_bytes),
+                "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                "state": "present",
+            }
+        ]
+
+    def test_plugin_raw_response_uses_one_byte_snapshot(self, tmp_path, monkeypatch):
+        from tools import skills_tool_plugin
+        from tools.skills_tool import skill_view
+
+        md = self._register_skill(tmp_path)
+        version_a = md.read_bytes()
+        version_b = version_a.replace(b"writing-plans body", b"replacement version")
+        original_read = skills_tool_plugin._read_authorized_file_bytes
+        snapshots = []
+
+        def replace_after_authorized_read(target, root):
+            data = original_read(target, root)
+            if target == md:
+                snapshots.append(data)
+                md.write_bytes(version_b)
+            return data
+
+        monkeypatch.setattr(
+            skills_tool_plugin,
+            "_read_authorized_file_bytes",
+            replace_after_authorized_read,
+        )
+        result = json.loads(
+            skill_view(
+                "superpowers:writing-plans",
+                preprocess=False,
+                raw_identity=True,
+                raw_text=True,
+            )
+        )
+
+        assert snapshots == [version_a]
+        assert result["success"] is True
+        served_bytes = result["content"].split("]\n\n", 1)[1].encode("utf-8")
+        assert served_bytes == version_a
+        assert result["raw_text"].encode("utf-8") == version_a
+        assert result["raw_files"][0]["sha256"] == hashlib.sha256(version_a).hexdigest()
 
     def test_reads_supporting_file_with_containment(self, tmp_path):
         from tools.skills_tool import skill_view

@@ -70,6 +70,48 @@ class TestApiModeAccepted:
     def test_api_mode_is_codex_app_server(self):
         agent = _make_codex_agent()
         assert agent.api_mode == "codex_app_server"
+        assert agent.model_tool_policy is None
+
+    def test_policy_bound_runtime_rejects_before_provider_or_process_start(self, monkeypatch):
+        provider_client = MagicMock(name="provider_client")
+        process_spawn = MagicMock(name="process_spawn")
+        monkeypatch.setattr("agent.process_bootstrap.OpenAI", provider_client)
+        monkeypatch.setattr("subprocess.Popen", process_spawn)
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"model_tool_policy.*codex_app_server.*exact tool policy",
+        ):
+            _make_codex_agent(
+                model_tool_policy={
+                    "policy_id": "codex-policy",
+                    "policy_sha256": "c" * 64,
+                    "allowed_tools": ["read_file"],
+                    "approval_required_tools": [],
+                }
+            )
+
+        provider_client.assert_not_called()
+        process_spawn.assert_not_called()
+
+    def test_policy_attached_after_init_rejects_before_transport_start(self):
+        agent = _make_codex_agent()
+        transport_turn = MagicMock(name="transport_turn")
+        agent._run_codex_app_server_turn = transport_turn
+        agent.model_tool_policy = {
+            "policy_id": "late-policy",
+            "policy_sha256": "d" * 64,
+            "allowed_tools": ["read_file"],
+            "approval_required_tools": [],
+        }
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"model_tool_policy.*codex_app_server.*exact tool policy",
+        ):
+            agent.run_conversation("must not reach codex")
+
+        transport_turn.assert_not_called()
 
 
 class TestRunConversationCodexPath:

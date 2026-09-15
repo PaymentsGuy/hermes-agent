@@ -319,9 +319,13 @@ class PluginLoaderMixin:
 
                 self._drop_fallback_hooks(_hook_source_of(manifest.name, module))
         except Exception as exc:
-            owned = [r for r in self._registration_order if r.plugin_key == plugin_key]
-            self._dispose_registrations(owned)
-            self._forget_registrations(owned)
+            # Serialize rollback with any registration already in flight for this generation. Otherwise a
+            # registry write can land before this snapshot and attach its ownership lease after cleanup.
+            with replacement_coordinator.transaction():
+                owned = [r for r in self._registration_order if r.plugin_key == plugin_key]
+                self._dispose_registrations(owned)
+                self._forget_registrations(owned)
+                self._invalidate_plugin_contexts({plugin_key})
             loaded.error = str(exc)
             # register() may have subscribed before raising; a failed plugin must leave no callable reachable
             # from later event dispatch.
