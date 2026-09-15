@@ -773,6 +773,25 @@ def test_stale_or_wrong_result_has_no_write_bump_or_sync(
     assert calls == {"bump": [], "sync": [], "clear": []}
 
 
+def test_unmanaged_owner_failure_reports_true_reason_and_identity(
+    guarded_home, monkeypatch
+):
+    usage = guarded_home / "skills" / ".usage.json"
+    usage.write_text(
+        json.dumps({"managed-skill": {"created_by": None, "pinned": False}}),
+        encoding="utf-8",
+    )
+
+    result = _approved_guarded_dispatch(_operation(), monkeypatch)
+
+    assert result["success"] is False
+    assert result["error_code"] == "precondition_failed"
+    assert result["error_summary"] == "guarded skill ownership is not curator-managed"
+    assert result["required_owner_class"] == "curator_managed"
+    assert result["observed_owner_class"] == "unmanaged"
+    assert result["observed_profile_relative_skill_root"] == "skills/managed-skill"
+
+
 def test_already_applied_rechecks_without_write_bump_or_sync(guarded_home, monkeypatch):
     from tools import skill_manager_tool
 

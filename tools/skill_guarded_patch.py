@@ -51,6 +51,17 @@ class GuardedPatchValidationError(ValueError):
 class GuardedPatchResolutionError(RuntimeError):
     """The guarded target could not be resolved to an executable exact state."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        observed_owner_class: str = "unknown",
+        observed_profile_relative_skill_root: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.observed_owner_class = observed_owner_class
+        self.observed_profile_relative_skill_root = observed_profile_relative_skill_root
+
 
 def guarded_patch_failure(error_code: str, error_summary: str, **identity) -> dict:
     return {
@@ -269,7 +280,11 @@ def _owner_skill_dir(operation: ValidatedGuardedPatch, skills_root: Path) -> Pat
     except Exception as exc:
         raise GuardedPatchResolutionError("guarded skill ownership record is unavailable") from exc
     if not isinstance(record, dict) or not skill_usage._is_curator_managed_record(record):
-        raise GuardedPatchResolutionError("guarded skill ownership is not curator-managed")
+        raise GuardedPatchResolutionError(
+            "guarded skill ownership is not curator-managed",
+            observed_owner_class="unmanaged",
+            observed_profile_relative_skill_root=actual_root,
+        )
     if record.get("pinned") is not False:
         raise GuardedPatchResolutionError("guarded patch rejects pinned skills")
     return skill_dir
@@ -340,15 +355,25 @@ def resolve_guarded_patch_target(operation: ValidatedGuardedPatch) -> GuardedPat
     )
 
 
-def _result_identity(operation: ValidatedGuardedPatch, receipt_id: str) -> dict[str, Any]:
+def _result_identity(
+    operation: ValidatedGuardedPatch,
+    receipt_id: str,
+    *,
+    observed_owner_class: str = "curator_managed",
+    observed_profile_relative_skill_root: str | None = None,
+) -> dict[str, Any]:
     return {
         "approval_receipt_id": receipt_id,
         "authorization_scope_id": operation.authorization_scope_id,
         "authorization_scope_sha256": operation.authorization_scope_sha256,
         "required_owner_class": operation.required_owner_class,
-        "observed_owner_class": "curator_managed",
+        "observed_owner_class": observed_owner_class,
         "expected_profile_relative_skill_root": operation.expected_profile_relative_skill_root,
-        "observed_profile_relative_skill_root": operation.expected_profile_relative_skill_root,
+        "observed_profile_relative_skill_root": (
+            operation.expected_profile_relative_skill_root
+            if observed_profile_relative_skill_root is None
+            else observed_profile_relative_skill_root
+        ),
     }
 
 
@@ -428,9 +453,16 @@ def execute_guarded_patch(
                 verified.current_manifest,
             )
 
-    except GuardedPatchResolutionError:
+    except GuardedPatchResolutionError as exc:
         return guarded_patch_failure(
-            "precondition_failed", "Exact guarded patch precondition was not satisfied.", **identity
+            "precondition_failed",
+            str(exc),
+            **_result_identity(
+                operation,
+                receipt.receipt_id,
+                observed_owner_class=exc.observed_owner_class,
+                observed_profile_relative_skill_root=exc.observed_profile_relative_skill_root,
+            ),
         )
 
     target = initial.target_path
