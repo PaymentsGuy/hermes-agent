@@ -116,6 +116,8 @@ def message_agent_authorized(agent: Any) -> bool:
     Bot-Mode canonical Bot Chat. Session-stable, so it is prompt-cache safe to re-evaluate
     on every tool-snapshot rebuild. Never raises."""
     try:
+        if getattr(agent, "_session_toolset_manifest_explicit", False):
+            return False
         if not getattr(agent, "_bot_mode_protocol", True):
             return False
         from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed

@@ -319,8 +319,40 @@ def _create_overrides(params: dict) -> tuple:
     return model_override, reasoning_override, service_tier_override
 
 
+def _session_capability_manifest(params: dict, profile_home=None) -> dict:
+    """Validate and freeze optional create-time capability selections in the target profile scope."""
+    manifest = {}
+    if "enabled_toolsets" in params and params.get("enabled_toolsets") is not None:
+        names = params["enabled_toolsets"]
+        if not isinstance(names, list):
+            raise ValueError("enabled_toolsets must be a list")
+        with _profile_build_scope(profile_home):
+            from toolsets import validate_toolset
+            invalid = [name for name in names if not isinstance(name, str) or not name
+                       or name != name.strip() or not validate_toolset(name)]
+        if invalid:
+            raise ValueError(
+                f"enabled_toolsets contains unknown or invalid name(s): {', '.join(map(repr, invalid))}")
+        manifest["enabled_toolsets"] = tuple(names)
+    if "preload_skills" in params and params.get("preload_skills") is not None:
+        names = params["preload_skills"]
+        if not isinstance(names, list):
+            raise ValueError("preload_skills must be a list")
+        invalid = [name for name in names
+                   if not isinstance(name, str) or not name or name != name.strip()]
+        if invalid:
+            raise ValueError(f"preload_skills contains invalid name(s): {', '.join(map(repr, invalid))}")
+        manifest["preload_skills"] = tuple(names)
+    return manifest
+
+
 @method("session.create")
 def _(rid, params: dict) -> dict:
+    profile_home = _profile_home(profile := (params.get("profile") or "").strip() or None)
+    try:
+        capability_manifest = _session_capability_manifest(params, profile_home)
+    except ValueError as exc:
+        return _err(rid, 4000, str(exc))
     (sid, source), key = _new_runtime_ids(params), _new_session_key()
     history = _coerce_seed_history(params.get("messages"))
     # Branch: links back so list_sessions_rich keeps it visible and the sidebar nests it.
@@ -332,7 +364,6 @@ def _(rid, params: dict) -> dict:
         explicit_cwd = bool(raw_cwd) and os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd)))
     _enable_gateway_prompts()
     # ``profile`` (app-global remote mode): stored so the build and every turn re-bind HERMES_HOME.
-    profile_home = _profile_home(profile := (params.get("profile") or "").strip() or None)
     session_model_override, create_reasoning_override, create_service_tier_override = _create_overrides(params)
     now = time.time()
     with _sessions_lock:
@@ -355,7 +386,8 @@ def _(rid, params: dict) -> dict:
             "running": False, "session_key": key, "show_reasoning": _load_show_reasoning(), "source": source,
             "slash_worker": None, "tool_progress_mode": _load_tool_progress_mode(), "tool_started_at": {},
             "transport": current_transport() or _stdio_transport,
-            "auth_user_id": _transport_auth_user_id(current_transport())}
+            "auth_user_id": _transport_auth_user_id(current_transport()),
+            **capability_manifest}
         _register_session_cwd(_sessions[sid])
     # No DB row here (drafts left "Untitled" litter): created on the first prompt — except seeded sessions.
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop launch (and every "New agent" /
@@ -390,7 +422,11 @@ def _(rid, params: dict) -> dict:
                  **({"provider": override["provider"]} if override.get("provider") else {}),
                  "tools": {}, "skills": {}, "cwd": cwd, "branch": git_probe.branch(cwd),
                  "project": _project_info_for_cwd(cwd), "lazy": True, "desktop_contract": DESKTOP_BACKEND_CONTRACT,
-                 "profile_name": _response_profile_name(profile)}})
+                 "profile_name": _response_profile_name(profile),
+                 **({"enabled_toolsets": list(capability_manifest["enabled_toolsets"])}
+                    if "enabled_toolsets" in capability_manifest else {}),
+                 **({"preload_skills": list(capability_manifest["preload_skills"])}
+                    if "preload_skills" in capability_manifest else {})}})
 
 
 def _unarchive_recoverable(db, session_id: str) -> bool:

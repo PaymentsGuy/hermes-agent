@@ -116,6 +116,16 @@ def test_config_toggle_disables_injection(tmp_path):
     assert agent.tools == []
 
 
+def test_explicit_session_capability_manifest_suppresses_dynamic_injection(tmp_path):
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Bot Chat")
+    setattr(agent, "_session_toolset_manifest_explicit", True)
+
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
+
+
 def test_schema_never_in_global_registry():
     """message_agent must not be registered/toolset-reachable anywhere."""
     from tools.registry import registry

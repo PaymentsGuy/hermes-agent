@@ -2762,7 +2762,7 @@
     },
     {
       "name": "session.create",
-      "summary": "Mint a live session (agent builds after the reply); a DB row appears on the first prompt unless seeded.",
+      "summary": "Mint a live session (agent builds after the reply); optional capability fields apply to this live creation only, and a DB row appears on the first prompt unless seeded.",
       "params": [
         {
           "name": "params",
@@ -25018,6 +25018,36 @@
             "default": false,
             "title": "Follow Profile Config",
             "type": "boolean"
+          },
+          "enabled_toolsets": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Enabled Toolsets"
+          },
+          "preload_skills": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Preload Skills"
           }
         },
         "title": "SessionCreateParams",
@@ -25319,6 +25349,36 @@
             ],
             "default": null,
             "title": "Lazy"
+          },
+          "enabled_toolsets": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Enabled Toolsets"
+          },
+          "preload_skills": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Preload Skills"
           }
         },
         "title": "SessionCwdSetResult",
@@ -26169,6 +26229,36 @@
             ],
             "default": null,
             "title": "Lazy"
+          },
+          "enabled_toolsets": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Enabled Toolsets"
+          },
+          "preload_skills": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Preload Skills"
           }
         },
         "title": "SessionLiveInfo",

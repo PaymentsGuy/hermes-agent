@@ -306,9 +306,11 @@ def _(rid, params: dict) -> dict:
             live = [(sid, sess) for sid, sess in _sessions.items() if sess.get("agent") is not None]
         for sid, sess in live:
             agent = sess["agent"]
-            try:  # enabled_override re-resolves toolsets so a server enabled in config this session is picked up
+            try:  # Explicit session manifests are immutable; ordinary sessions adopt current profile config.
                 with _session_profile_runtime_scope(sess):
-                    _mcp_agent.refresh_agent_mcp_tools(agent, enabled_override=_load_enabled_toolsets(), quiet_mode=True)
+                    kwargs = ({"quiet_mode": True} if "enabled_toolsets" in sess else {
+                            "enabled_override": _load_enabled_toolsets(), "quiet_mode": True})
+                    _mcp_agent.refresh_agent_mcp_tools(agent, **kwargs)
             except Exception as _exc:
                 logger.warning("Failed to refresh cached agent tools after /reload-mcp (session %s): %s", sid, _exc)
             _emit("session.info", sid, _session_info(agent, sess))

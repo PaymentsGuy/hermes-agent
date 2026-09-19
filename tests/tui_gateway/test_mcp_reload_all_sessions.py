@@ -69,3 +69,25 @@ def test_reload_rediscovers_under_each_live_profile_scope(reload_env):
 
     assert hermes_constants.hermes_home_key() in reload_env.discovered_homes
     assert hermes_constants.hermes_home_key(reload_env.profile_b) in reload_env.discovered_homes
+
+
+def test_reload_preserves_explicit_session_capability_manifest(reload_env, monkeypatch):
+    calls = []
+    restricted = srv._sessions["A"]
+    restricted["enabled_toolsets"] = ("file",)
+    restricted["agent"].enabled_toolsets = ["file"]
+    srv._sessions["B"]["agent"].enabled_toolsets = ["web"]
+    monkeypatch.setattr(
+        _mcp_agent,
+        "refresh_agent_mcp_tools",
+        lambda agent, **kwargs: calls.append((agent.name, kwargs)) or set(),
+    )
+    monkeypatch.setattr(srv, "_load_enabled_toolsets", lambda *_a, **_kw: ["web"])
+
+    response = srv._methods["reload.mcp"](1, {"confirm": True})
+
+    assert response["result"]["status"] == "reloaded"
+    restricted_call = next(kwargs for name, kwargs in calls if name == "agent-A")
+    ordinary_call = next(kwargs for name, kwargs in calls if name == "agent-B")
+    assert "enabled_override" not in restricted_call
+    assert ordinary_call["enabled_override"] == ["web"]

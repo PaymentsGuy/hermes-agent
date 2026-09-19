@@ -1000,6 +1000,9 @@ def _deferred_build_agent_kwargs(current: dict, session_db) -> dict:
         kw.update({k: v for k, v in (("reasoning_config_override", current.get("create_reasoning_override")),
                                      ("service_tier_override", current.get("create_service_tier_override")))
                    if v is not None})
+    for field in ("enabled_toolsets", "preload_skills"):
+        if field in current:
+            kw[field] = list(current[field])
     return kw
 
 
@@ -2122,6 +2125,8 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "version": "", "release_date": "", "update_behind": None, "update_command": "",
         "usage": _session_usage_snapshot(session),
         "profile_name": profile_name_for_home(sess.get("profile_home")) or _current_profile_name(),
+        **({"enabled_toolsets": list(sess["enabled_toolsets"])} if "enabled_toolsets" in sess else {}),
+        **({"preload_skills": list(sess["preload_skills"])} if "preload_skills" in sess else {}),
     }
     with contextlib.suppress(Exception):
         from hermes_cli import __version__, __release_date__
@@ -2288,19 +2293,23 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
     return model, resolution.runtime
 
 
-def _startup_system_prompt(cfg: dict, task_id: str) -> str:
-    """Config ephemeral system prompt + HERMES_TUI_SKILLS preload block. Hard-fails only when EVERY requested
-    skill is missing (cli.py parity): a typo'd name must not auto-block the Kanban task."""
+def _startup_system_prompt(cfg: dict, task_id: str, preload_skills: list[str] | tuple[str, ...] | None = None) -> str:
+    """Config prompt plus startup skills; an explicit session manifest fails on any missing skill.
+
+    The legacy HERMES_TUI_SKILLS path keeps its permissive CLI parity: a typo only hard-fails when every
+    requested skill is missing, so one typo cannot auto-block a Kanban task.
+    """
     from hermes_cli.config import resolve_ephemeral_system_prompt_from_config
     system_prompt = resolve_ephemeral_system_prompt_from_config(cfg)
-    startup_skills = _parse_tui_skills_env()
+    explicit = preload_skills is not None
+    startup_skills = list(preload_skills) if explicit else _parse_tui_skills_env()
     if not startup_skills:
         return system_prompt
     from agent.skill_commands import build_preloaded_skills_prompt
     skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(startup_skills, task_id=task_id)
     if missing_skills:
         missing_display = ", ".join(missing_skills)
-        if not loaded_skills:
+        if explicit or not loaded_skills:
             raise ValueError(f"Unknown skill(s): {missing_display}")
         logger.warning("Unknown skill(s) requested, skipping: %s. Continuing with: %s. "
                        "List available skills with `hermes skills list`.", missing_display, ", ".join(loaded_skills))
@@ -2334,7 +2343,8 @@ def _make_agent(
     model_override: dict | str | None = None, provider_override: str | None = None,
     reasoning_config_override: dict | None = None, service_tier_override: str | None = None,
     platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None,
-    cwd_override: str | None = None, auth_user_id: str | None = None):
+    cwd_override: str | None = None, auth_user_id: str | None = None,
+    enabled_toolsets: list[str] | None = None, preload_skills: list[str] | None = None):
     # AC-4 test seam: dead unless armed by the isolated certify harness.
     from tui_gateway.synthetic_turn import maybe_build_synthetic_agent
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
@@ -2350,7 +2360,7 @@ def _make_agent(
     # Load hooks alongside the same profile config used to construct this agent.
     from agent.shell_hooks import register_from_config
     register_from_config(cfg)
-    system_prompt = _startup_system_prompt(cfg, session_id or key)
+    system_prompt = _startup_system_prompt(cfg, session_id or key, preload_skills)
     model, runtime = _resolve_agent_model_runtime(model_override, provider_override)
     _pr = _load_provider_routing()
     platform = _resolve_agent_platform(platform_override)
@@ -2366,7 +2376,7 @@ def _make_agent(
         reasoning_config=(
             reasoning_config_override if reasoning_config_override is not None else _load_reasoning_config(str(model or ""))),
         service_tier=service_tier_override if service_tier_override is not None else _load_service_tier(),
-        enabled_toolsets=_load_enabled_toolsets(platform),
+        enabled_toolsets=(_load_enabled_toolsets(platform) if enabled_toolsets is None else list(enabled_toolsets)),
         # OpenRouter provider_routing prefs (gateway + CLI parity).
         providers_allowed=_pr.get("only"), providers_ignored=_pr.get("ignore"), providers_order=_pr.get("order"),
         provider_sort=_pr.get("sort"), provider_require_parameters=_pr.get("require_parameters", False),
@@ -2383,6 +2393,7 @@ def _make_agent(
     if context_cwd_is_launch_artifact is None:
         context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(session)
     agent._context_cwd_is_launch_artifact = bool(context_cwd_is_launch_artifact)
+    setattr(agent, "_session_toolset_manifest_explicit", enabled_toolsets is not None)
     return agent
 
 

@@ -600,6 +600,8 @@ export interface SessionLiveInfo {
   system_prompt?: string | null
   credential_warning?: string | null
   lazy?: boolean | null
+  enabled_toolsets?: string[] | null
+  preload_skills?: string[] | null
   [key: string]: unknown
 }
 /** ``tui_gateway/server.py::_project_info_for_cwd``. */
@@ -2454,6 +2456,8 @@ export interface SessionCreateParams {
   hidden?: boolean
   room_plumbing?: boolean
   follow_profile_config?: boolean
+  enabled_toolsets?: string[] | null
+  preload_skills?: string[] | null
 }
 /** One create-time transcript row (``session_history._coerce_seed_history``); ``text`` is the legacy alias of ``content``; only ``display_kind: "hidden"`` is accepted from the wire. Clients forward stored rows verbatim (``_row_id``, ``timestamp``, …) and the coercer drops what it does not use, so the row stays open. */
 export interface SeedMessage {
@@ -2708,6 +2712,8 @@ export interface SessionCwdSetResult {
   system_prompt?: string | null
   credential_warning?: string | null
   lazy?: boolean | null
+  enabled_toolsets?: string[] | null
+  preload_skills?: string[] | null
   [key: string]: unknown
 }
 export interface SessionCloseParams {
@@ -4479,7 +4485,7 @@ export interface RpcMethods {
   'session.control': { params: SessionControlParams; result: SessionControlResult }
   /** Stable, allowlisted snapshot of one live session's goal / loop / heartbeat state. */
   'session.control.read': { params: SessionControlReadParams; result: SessionControlReadResult }
-  /** Mint a live session (agent builds after the reply); a DB row appears on the first prompt unless seeded. */
+  /** Mint a live session (agent builds after the reply); optional capability fields apply to this live creation only, and a DB row appears on the first prompt unless seeded. */
   'session.create': { params: SessionCreateParams; result: SessionCreateResult }
   /** Change a live, idle session's working directory. */
   'session.cwd.set': { params: SessionCwdSetParams; result: SessionCwdSetResult }

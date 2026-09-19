@@ -128,6 +128,10 @@ class SessionCreateParams(ProfileParams):
     hidden: bool = False
     room_plumbing: bool = False
     follow_profile_config: bool = False
+    # Create-time-only live capability manifest. [] deliberately means no model tools.
+    enabled_toolsets: list[str] | None = None
+    # Exact installed skill names; any missing entry fails the deferred agent build closed.
+    preload_skills: list[str] | None = None
 
 
 class SessionCreateResult(Result):
@@ -139,7 +143,8 @@ class SessionCreateResult(Result):
 
 
 method("session.create", params=SessionCreateParams, result=SessionCreateResult,
-       doc="Mint a live session (agent builds after the reply); a DB row appears on the first prompt unless seeded.")
+       doc="Mint a live session (agent builds after the reply); optional capability fields apply to this live "
+           "creation only, and a DB row appears on the first prompt unless seeded.")
 
 
 # ── session.resume / activate ─────────────────────────────────────────────────────────────────

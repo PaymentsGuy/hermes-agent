@@ -327,7 +327,11 @@ class ComputeHost:
                 cwd_override=str(frame.get("cwd") or "") or None,
                 context_cwd_is_launch_artifact=bool(
                     frame.get("context_cwd_is_launch_artifact", False)),
-                session_db=session_db, auth_user_id=frame.get("auth_user_id"))
+                session_db=session_db, auth_user_id=frame.get("auth_user_id"),
+                **({"enabled_toolsets": list(frame["enabled_toolsets"])}
+                   if "enabled_toolsets" in frame else {}),
+                **({"preload_skills": list(frame["preload_skills"])}
+                   if "preload_skills" in frame else {}))
             if server._transfer_db_to_agent(agent, session_db):
                 owns_db = False
         finally:
@@ -373,6 +377,9 @@ class ComputeHost:
         session["profile_home"] = profile_home or session.get("profile_home")
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")
+        for field in ("enabled_toolsets", "preload_skills"):
+            if field in frame:
+                session[field] = tuple(frame[field])
         return session
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:

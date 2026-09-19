@@ -91,6 +91,8 @@ class SessionLiveInfo(OpenModel):
     system_prompt: str | None = None
     credential_warning: str | None = None
     lazy: bool | None = None
+    enabled_toolsets: list[str] | None = None
+    preload_skills: list[str] | None = None
 
 
 class StoredSessionRow(OpenModel):

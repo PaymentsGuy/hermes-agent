@@ -67,7 +67,11 @@ def _compute_host_turn_frame(
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session), "attached_images": attached_images,
         "auth_user_id": _session_auth_user_id(session),
-        "queued_prompt_generation": queued_prompt_generation}
+        "queued_prompt_generation": queued_prompt_generation,
+        **({"enabled_toolsets": list(session["enabled_toolsets"])}
+           if "enabled_toolsets" in session else {}),
+        **({"preload_skills": list(session["preload_skills"])}
+           if "preload_skills" in session else {})}
 
 
 def _metadata_mirror(session: dict | None) -> dict:
