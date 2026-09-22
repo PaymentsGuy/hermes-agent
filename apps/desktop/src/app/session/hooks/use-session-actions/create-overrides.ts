@@ -10,8 +10,6 @@
  * no caller needs one.
  */
 export interface SessionCreateOverrides {
-  modelToolPolicy?: Record<string, unknown>
-  preloadSkills?: string[]
   reasoningEffort?: string
   title?: string
 }
@@ -24,8 +22,6 @@ export interface SessionSeedMessage {
 
 export interface SessionCreateOverrideParams {
   messages?: SessionSeedMessage[]
-  model_tool_policy?: Record<string, unknown>
-  preload_skills?: string[]
   reasoning_effort?: string
   title?: string
 }
@@ -42,14 +38,6 @@ export function sessionCreateOverrideParams(
 
   if (overrides?.reasoningEffort) {
     params.reasoning_effort = overrides.reasoningEffort
-  }
-
-  if (overrides?.preloadSkills?.length) {
-    params.preload_skills = [...overrides.preloadSkills]
-  }
-
-  if (overrides?.modelToolPolicy) {
-    params.model_tool_policy = { ...overrides.modelToolPolicy }
   }
 
   if (seedMessages?.length) {

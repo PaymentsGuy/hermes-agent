@@ -30,7 +30,6 @@ import {
   $narrowViewport,
   $newSessionTabAction,
   $paneVisible,
-  $programmaticSessionStartAction,
   registerPaneCloser,
   removeTreePane,
   revealTreePane
@@ -1274,34 +1273,6 @@ export const host = {
     }
 
     window.location.hash = '#/'
-  },
-
-  /** Create, publish, and focus one visible Desktop session through the core
-   * new-tab path. Raw `session.create` followed by `openSession` must not be
-   * used for this: that resumes the same stored session into a second runtime. */
-  startSession: async (options: {
-    cwd?: null | string
-    modelToolPolicy?: Record<string, unknown>
-    preloadSkills?: string[]
-    profile: string
-    title: string
-  }): Promise<{ session_id: string; stored_session_id: string }> => {
-    const start = $programmaticSessionStartAction.get()
-
-    if (!start) {
-      throw new Error('Hermes Desktop is not ready to start a visible session')
-    }
-
-    const created = await start(options)
-
-    if (!created) {
-      throw new Error('Hermes Desktop could not start the visible session')
-    }
-
-    return {
-      session_id: created.runtimeSessionId,
-      stored_session_id: created.storedSessionId
-    }
   },
 
   /** Front the tab a Bot Mode owner already has open — the tile that owner's

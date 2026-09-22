@@ -790,7 +790,6 @@ export function useSessionActions({
         listed?: boolean
         profile?: string
         route?: AgentProfileRoute | null
-        createOverrides?: SessionCreateOverrides
         workspaceScope?: SessionTileWorkspaceScope
       }
     ) => {
@@ -849,8 +848,7 @@ export function useSessionActions({
             requestedProfile,
             options?.route === null || defaultTarget?.route === null
           )),
-          ...(workspaceScope.workspaceMode === 'bots' ? { hidden: true } : {}),
-          ...sessionCreateOverrideParams(options?.createOverrides)
+          ...(workspaceScope.workspaceMode === 'bots' ? { hidden: true } : {})
         }
 
         // Same lease chain as createBackendSessionForSend: owner socket held
@@ -907,7 +905,7 @@ export function useSessionActions({
           await closeCreated.catch(() => undefined)
           notify({ kind: 'error', title: copy.sessionUnavailable, message: copy.createSessionFailed })
 
-          return null
+          return
         }
 
         createdThisRun.add(stored)
@@ -949,12 +947,8 @@ export function useSessionActions({
         if (listed) {
           broadcastSessionsChanged()
         }
-
-        return { runtimeSessionId: created.session_id, storedSessionId: stored }
       } catch (error) {
         notifyError(error, copy.createSessionFailed)
-
-        return null
       }
     },
     [copy, requestGateway, updateSessionState]

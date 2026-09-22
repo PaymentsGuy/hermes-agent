@@ -25,11 +25,7 @@ import { IntroRevealGate } from '@/components/intro-reveal'
 import { NotificationStack } from '@/components/notifications'
 import { DesktopOnboardingOverlay } from '@/components/onboarding'
 import { OnboardingChatGate } from '@/components/onboarding-chat/gate'
-import {
-  $newSessionTabAction,
-  $programmaticSessionStartAction,
-  registerPaneCloser
-} from '@/components/pane-shell/tree/store'
+import { $newSessionTabAction, registerPaneCloser } from '@/components/pane-shell/tree/store'
 import {
   $workspaceMode,
   $workspaceNewSessionTarget,
@@ -1103,23 +1099,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
     return () => $newSessionTabAction.set(null)
   }, [openNewSessionTab])
-
-  useEffect(() => {
-    $programmaticSessionStartAction.set(options =>
-      openNewSessionTile('center', {
-        cwd: options.cwd,
-        listed: false,
-        profile: options.profile,
-        createOverrides: {
-          title: options.title,
-          preloadSkills: options.preloadSkills,
-          modelToolPolicy: options.modelToolPolicy
-        }
-      })
-    )
-
-    return () => $programmaticSessionStartAction.set(null)
-  }, [openNewSessionTile])
 
   // The MAIN tab's Close. The workspace pane can't leave the tree, so its
   // closer empties it instead: the next stacked session shifts in, else main
