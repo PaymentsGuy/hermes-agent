@@ -723,6 +723,26 @@ export function treePanesWithPrefix(prefix: string): string[] {
  *  An atom so the strip re-renders when the action becomes available. */
 export const $newSessionTabAction = atom<(() => void) | null>(null)
 
+export interface ProgrammaticSessionStartOptions {
+  cwd?: null | string
+  modelToolPolicy?: Record<string, unknown>
+  preloadSkills?: string[]
+  profile: string
+  title: string
+}
+
+export interface ProgrammaticSessionStartResult {
+  runtimeSessionId: string
+  storedSessionId: string
+}
+
+/** Create, publish, and focus one live session tile through the same owner-aware
+ * foreground path as the tab-strip "+". Runtime plugins use this instead of
+ * creating a detached backend session and trying to resume it afterward. */
+export const $programmaticSessionStartAction = atom<
+  ((options: ProgrammaticSessionStartOptions) => Promise<ProgrammaticSessionStartResult | null>) | null
+>(null)
+
 /**
  * Keyboard slots (⌘1…⌘9, ⌃Tab) must index the SAME tabs the strip paints —
  * chrome-hidden panes (files in Focus layout), unregistered ones, and
