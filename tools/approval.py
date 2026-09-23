@@ -51,7 +51,6 @@ _lock = threading.Lock()
 _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
-_session_unattended_safe: set[str] = set()
 _permanent_approved: set = set()
 # Routed multiplex profiles: one permanent allowlist per profile home (see ``_permanent_set``).
 _permanent_approved_by_home: dict[str, set] = {}
@@ -283,57 +282,13 @@ def disable_session_yolo(session_key: str) -> None:
     _set_session_yolo(session_key, False)
 
 
-def enable_session_unattended_safe_mode(session_key: str) -> None:
-    """Run safe calls without prompts and fail closed on every approval-gated call.
-
-    This is deliberately not YOLO: dangerous commands, arbitrary-code execution,
-    plugin-marked paid/destructive tools, and sensitive writes remain blocked.
-    The grant is memory-only and expires with the live session/process.
-    """
-    if not session_key:
-        return
-    with _lock:
-        _session_unattended_safe.add(session_key)
-
-
-def disable_session_unattended_safe_mode(session_key: str) -> None:
-    if not session_key:
-        return
-    with _lock:
-        _session_unattended_safe.discard(session_key)
-
-
-def transfer_session_unattended_safe_mode(old_key: str, new_key: str) -> bool:
-    """Atomically move an active in-memory unattended-safe grant to a continuation."""
-    if not old_key or not new_key:
-        return False
-    with _lock:
-        if old_key not in _session_unattended_safe:
-            return False
-        _session_unattended_safe.discard(old_key)
-        _session_unattended_safe.add(new_key)
-        return True
-
-
-def is_session_unattended_safe_mode(session_key: str) -> bool:
-    if not session_key:
-        return False
-    with _lock:
-        return session_key in _session_unattended_safe
-
-
-def is_current_session_unattended_safe_mode() -> bool:
-    return is_session_unattended_safe_mode(get_current_session_key(default=""))
-
-
 def clear_session(session_key: str) -> None:
-    """Remove all approval, YOLO, and unattended-safe state for a session."""
+    """Remove all approval and yolo state for a given session."""
     if not session_key:
         return
     with _lock:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
-        _session_unattended_safe.discard(session_key)
         _pending.pop(session_key, None)
         for entry in _gateway_queues.pop(session_key, []):
             # Cancel blocked waits now so the old run unwinds instead of idling until timeout;
@@ -574,15 +529,6 @@ def _denied(message: str, *, pattern_key: str, description: str, outcome: str, n
 def _blocked(message: str, *, pattern_key: str, description: str) -> dict:
     """Non-interactive block (cron / -q / unattended / no-human): no consent keys."""
     return {"approved": False, "message": message, "pattern_key": pattern_key, "description": description}
-
-
-def _unattended_safe_block(pattern_key: str, description: str, *, noun: str = "operation") -> dict:
-    return _denied(
-        f"BLOCKED: {description}. This session may run routine work unattended, but it cannot "
-        "auto-authorize an approval-gated operation. Do not retry or rephrase it; report the "
-        "blocked boundary and stop if no safe alternative exists.",
-        pattern_key=pattern_key, description=description, outcome="blocked", noun=noun,
-    )
 
 
 def _user_approved(session_key: str, description: str) -> dict:
@@ -1024,11 +970,9 @@ def _run_approval_gate(
     # ``approvals.mode: off`` is the third bypass source (the Desktop "Approvals: off" toggle writes it); the shell
     # guards honour it, so every action routed through this gate (computer_use, plugin rules, SSH-config writes,
     # dangerous-pattern prompts) must too, or "off" still prompts on those surfaces.
-    session_key = get_current_session_key()
-    if is_session_unattended_safe_mode(session_key):
-        return _unattended_safe_block(pattern_key, description, noun=noun.rstrip("s"))
     if _yolo_active() or approval_context._get_approval_mode() == "off":
         return _approved()
+    session_key = get_current_session_key()
     if is_approved(session_key, pattern_key):
         return _approved()
 
@@ -1133,14 +1077,12 @@ def check_dangerous_command(command: str, env_type: str,
     blocked = _floor_block(command)
     if blocked is not None:
         return blocked
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
-    if not is_dangerous:
-        return _approved()
-    if is_current_session_unattended_safe_mode():
-        return _unattended_safe_block(pattern_key, description, noun="command")
     if _yolo_active():
         return _approved()
     if _command_matches_permanent_allowlist(command):
+        return _approved()
+    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    if not is_dangerous:
         return _approved()
     return _run_approval_gate(
         pattern_key=pattern_key, description=description, display_target=command, approval_callback=approval_callback,
@@ -1221,23 +1163,6 @@ def check_all_command_guards(command: str, env_type: str,
     dangerous-command findings are presented as ONE combined approval request, so a gateway
     force=True replay cannot bypass one check when only the other was shown to the user.
     ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
-    session_key = get_current_session_key()
-    if is_session_unattended_safe_mode(session_key):
-        blocked = _floor_block(command, sudo_guard=True)
-        if blocked is not None:
-            return blocked
-        tirith_result = _tirith_scan(command)
-        is_dangerous, pattern_key, description = detect_dangerous_command(command)
-        if tirith_result["action"] in {"block", "warn"}:
-            findings = tirith_result.get("findings") or []
-            rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
-            return _unattended_safe_block(
-                f"tirith:{rule_id}", _format_tirith_description(tirith_result), noun="command"
-            )
-        if is_dangerous:
-            return _unattended_safe_block(pattern_key, description, noun="command")
-        return _approved()
-
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
 
@@ -1271,6 +1196,7 @@ def check_all_command_guards(command: str, env_type: str,
     tirith_result = _tirith_scan(command)
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     warnings = []
+    session_key = get_current_session_key()
     if tirith_result["action"] in {"block", "warn"}:
         findings = tirith_result.get("findings") or []
         rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
@@ -1321,9 +1247,6 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     """
     pattern_key = "execute_code"
     description = _EXECUTE_CODE_DESCRIPTION
-
-    if is_current_session_unattended_safe_mode():
-        return _unattended_safe_block(pattern_key, description, noun="code")
 
     # Isolated backends already sandbox the child. vercel_sandbox has no host-bind concept so it stays always-skipped.
     if env_type == "vercel_sandbox":

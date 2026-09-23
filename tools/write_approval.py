@@ -174,16 +174,6 @@ def evaluate_gate(subsystem: str, *, inline_summary: str = "", inline_detail: st
     is produced only when the user actively denies the inline prompt."""
     if not write_approval_enabled(subsystem):
         return GateDecision(allow=True)
-    try:
-        from tools.approval import is_current_session_unattended_safe_mode
-        if is_current_session_unattended_safe_mode():
-            return GateDecision(
-                blocked=True,
-                message=(f"{subsystem.capitalize()} write blocked by unattended-safe mode; "
-                         "no approval prompt is permitted."),
-            )
-    except Exception:
-        pass
     # Skills are too big to review inline; a background write runs in a daemon thread with no user.
     if subsystem == SKILLS or current_origin() == "background_review":
         return _staged(subsystem)
