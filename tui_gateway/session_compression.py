@@ -272,7 +272,8 @@ def _sync_session_key_after_compress(
     old_key = session.get("session_key", "") or ""
     if not new_session_id or new_session_id == old_key:
         return
-    if not _transfer_active_session_slot(sid, session, new_session_id=new_session_id):
+    slot_transferred = _transfer_active_session_slot(sid, session, new_session_id=new_session_id)
+    if not slot_transferred:
         logger.warning(
             "Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
             sid, old_key, new_session_id,
@@ -287,6 +288,11 @@ def _sync_session_key_after_compress(
             if approval.is_session_yolo_enabled(old_key):
                 approval.enable_session_yolo(new_session_id)
                 approval.disable_session_yolo(old_key)
+        with contextlib.suppress(Exception):
+            if slot_transferred:
+                approval.transfer_session_unattended_safe_mode(old_key, new_session_id)
+            else:
+                approval.disable_session_unattended_safe_mode(old_key)
         with contextlib.suppress(Exception):
             approval.register_gateway_notify(new_session_id, lambda data: _emit_approval_request(sid, data))
     # Invalidate any in-flight ``_drain_queued_prompt`` claim taken under the pre-rotation key: a raced

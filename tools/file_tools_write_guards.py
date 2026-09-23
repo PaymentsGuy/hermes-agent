@@ -280,9 +280,13 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     except Exception:
         return blocked.format(why=_APPROVAL_UNAVAILABLE)
 
+    # Unattended-safe sessions never open a human prompt for protected writes.
+    session_key = get_current_session_key()
+    if _approval.is_session_unattended_safe_mode(session_key):
+        return blocked.format(why="is blocked by unattended-safe mode; no approval prompt is permitted.")
+
     # Gateway surface: block on the button round-trip when a notify callback
     # is registered for this session. One-operation only — no scope buttons.
-    session_key = get_current_session_key()
     try:
         with _approval._lock:
             notify_cb = _approval._gateway_notify_cbs.get(session_key)

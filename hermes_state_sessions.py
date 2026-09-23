@@ -760,6 +760,28 @@ class SessionSessionsMixin:
             lambda merged: (merged, model, session_id),
         )
 
+    def claim_action_os_unattended_activation(self, session_id: str, fingerprint: str) -> bool:
+        """Persist one consume-once marker without persisting unattended authority itself."""
+        if not session_id or not fingerprint:
+            return False
+
+        def _claim(conn) -> bool:
+            row = conn.execute("SELECT model_config FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if row is None:
+                return False
+            config = _parse_model_config(row[0])
+            key = "action_os_unattended_activation_consumed"
+            if config.get(key):
+                return False
+            config[key] = fingerprint
+            conn.execute(
+                "UPDATE sessions SET model_config = ? WHERE id = ?",
+                (json.dumps(config), session_id),
+            )
+            return True
+
+        return bool(self._execute_write(_claim))
+
     def set_session_yolo(self, session_id: str, enabled: bool) -> None:
         """Persist the per-session YOLO flag so ``/yolo`` survives ``--resume``; no-op without a row."""
         if not session_id:
